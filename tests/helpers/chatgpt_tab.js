@@ -109,7 +109,7 @@ function chat(options = {}) {
     return {
         dom, w, messages, inserted, mount, advance,
         get sends() { return sendCount; },
-        deliver(id = 'job', prompt = 'Solve these questions', answerTimeoutMs = options.answerTimeoutMs, extra = {}) { let ack; receiver({ type: 'PARAMEXT_CHATGPT_RUN', job: { id, prompt, answerTimeoutMs, images: options.images, ...extra } }, { id: 'extension' }, response => { ack = response; }); return ack; }
+        deliver(id = 'job', prompt = 'Solve these questions', answerTimeoutMs = options.answerTimeoutMs, extra = {}) { let ack; receiver({ type: 'PARAMEXT_CHATGPT_RUN', job: { id, prompt, answerTimeoutMs, attachments: options.attachments, ...extra } }, { id: 'extension' }, response => { ack = response; }); return ack; }
     };
 }
 

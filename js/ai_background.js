@@ -5,12 +5,34 @@
     // Extra time covers tab loading, editor/send setup and result delivery.
     const answerTimeout = value => Math.min(3600000, Math.max(60000, Number(value) || 600000));
     const jobTimeout = job => answerTimeout(job.answerTimeoutMs) + 120000;
+    // Full-resolution pages can exceed chrome.storage.session's 10 MB quota.
+    // Keep PDF bytes in IndexedDB and only request metadata in session storage.
+    let attachmentDatabase;
+    function documentDatabase() {
+        if (!attachmentDatabase) attachmentDatabase = new Promise((resolve, reject) => {
+            const open = indexedDB.open('moodushAiDocuments', 1);
+            open.onupgradeneeded = () => open.result.createObjectStore('attachments');
+            open.onsuccess = () => resolve(open.result);
+            open.onerror = () => { attachmentDatabase = null; reject(open.error); };
+        });
+        return attachmentDatabase;
+    }
+    async function attachmentData(mode, action) {
+        const database = await documentDatabase();
+        return new Promise((resolve, reject) => {
+            const transaction = database.transaction('attachments', mode);
+            const request = action(transaction.objectStore('attachments'));
+            transaction.oncomplete = () => resolve(request?.result);
+            transaction.onerror = transaction.onabort = () => reject(transaction.error || new Error('PDF storage failed'));
+        });
+    }
     let reserving = false;
     let dispatching = false;
     const isOpenedu = url => { try { return /(^|\.)openedu\.ru$/.test(new URL(url).hostname); } catch (_) { return false; } };
     const isChatgpt = url => { try { return new URL(url).origin === 'https://chatgpt.com'; } catch (_) { return false; } };
     async function finish(job, result) {
         await chrome.storage.session.remove(KEY);
+        if (job.hasAttachment) await attachmentData('readwrite', store => store.delete(job.id));
         try {
             // Keep a failed composer visible so its status/draft can be inspected.
             if (!result.error) await chrome.tabs.update(job.sourceTab, { active: true });
@@ -35,7 +57,9 @@
             const tab = await chrome.tabs.get(job.aiTab);
             if (!isChatgpt(tab.url) || tab.status !== 'complete') return;
             if (current.deliveryStartedAt == null) await chrome.storage.session.set({ [KEY]: { ...current, deliveryStartedAt: Date.now() } });
-            const acknowledgement = await chrome.tabs.sendMessage(job.aiTab, { type: 'PARAMEXT_CHATGPT_RUN', job: { id: job.id, prompt: job.prompt, images: job.images, answerTimeoutMs: answerTimeout(job.answerTimeoutMs), resume: job.resume, mayHaveSent: job.mayHaveSent || ['sending', 'submitted'].includes(job.phase), userTurnId: job.userTurnId } }, { frameId: 0 });
+            const attachments = job.hasAttachment ? await attachmentData('readonly', store => store.get(job.id)) : [];
+            if (job.hasAttachment && !attachments?.length) throw new Error('The full-page PDF is missing. Retry the course request.');
+            const acknowledgement = await chrome.tabs.sendMessage(job.aiTab, { type: 'PARAMEXT_CHATGPT_RUN', job: { id: job.id, prompt: job.prompt, attachments, answerTimeoutMs: answerTimeout(job.answerTimeoutMs), resume: job.resume, mayHaveSent: job.mayHaveSent || ['sending', 'submitted'].includes(job.phase), userTurnId: job.userTurnId } }, { frameId: 0 });
             if (acknowledgement?.busy) {
                 // The previous result can reach OpenEdu before the tab adapter
                 // clears activeJob. Retry the queued request once it releases.
@@ -79,12 +103,12 @@
                     const stored = await chrome.storage.session.get([KEY, TAB]);
                     if (stored[KEY] && Date.now() - stored[KEY].createdAt < jobTimeout(stored[KEY])) return { error: 'Another AI request is running', busy: true };
                     if (typeof message.prompt !== 'string' || message.prompt.length > 100000) throw new Error('Invalid AI prompt');
-                    const images = message.images || [];
-                    if (!Array.isArray(images) || images.length > 12 || images.some(image =>
-                        !image || typeof image.name !== 'string' || !/^question-[A-Za-z0-9_-]+-\d+\.png$/.test(image.name)
-                        || typeof image.dataUrl !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image.dataUrl))
-                        || images.reduce((size, image) => size + image.dataUrl.length, 0) > 6000000) {
-                        throw new Error('Invalid or oversized AI screenshots (maximum 12 images / 6 MB)');
+                    const attachments = message.attachments || [];
+                    if (!Array.isArray(attachments) || attachments.length > 1 || attachments.some(file =>
+                        !file || typeof file.name !== 'string' || file.name !== 'openedu-full-page.pdf' || file.mimeType !== 'application/pdf'
+                        || typeof file.dataUrl !== 'string' || !/^data:application\/pdf;base64,[A-Za-z0-9+/]+=*$/.test(file.dataUrl))
+                        || attachments.reduce((size, file) => size + file.dataUrl.length, 0) > 64000000) {
+                        throw new Error('Invalid or oversized full-page PDF (maximum one PDF / 48 MB)');
                     }
                     let tab;
                     if (stored[TAB]) {
@@ -93,7 +117,11 @@
                     }
                     if (!tab) tab = await chrome.tabs.create({ url: 'https://chatgpt.com/', active: true });
                     else await chrome.tabs.update(tab.id, { active: true });
-                    const job = { id: crypto.randomUUID(), sourceTab: sender.tab.id, sourceFrame: sender.frameId, aiTab: tab.id, createdAt: Date.now(), prompt: message.prompt, images, answerTimeoutMs: answerTimeout(message.answerTimeoutMs) };
+                    const job = { id: crypto.randomUUID(), sourceTab: sender.tab.id, sourceFrame: sender.frameId, aiTab: tab.id, createdAt: Date.now(), prompt: message.prompt, hasAttachment: attachments.length > 0, answerTimeoutMs: answerTimeout(message.answerTimeoutMs) };
+                    await attachmentData('readwrite', store => {
+                        store.clear();
+                        return attachments.length ? store.put(attachments, job.id) : undefined;
+                    });
                     await chrome.storage.session.set({ [KEY]: job, [TAB]: tab.id });
                     // Query current readiness after saving: create() can return a stale
                     // loading status after onUpdated/READY have already fired.

@@ -16,7 +16,7 @@ function pageHtml(body, asFrame = false) {
     for (const file of ['platform_settings', 'openedu_shared', 'openedu_course_api', 'openedu_parser', 'openedu_ai', 'openedu_capture_frames', 'openedu_content']) {
         let code = fs.readFileSync(require.resolve('../js/' + file + '.js'), 'utf8');
         if (file === 'openedu_content' && asFrame) code = code.replace('const isTopFrame = window === window.top;', 'const isTopFrame = false;');
-        if (file === 'openedu_content') code = code.replace('    boot();', 'window.__test = { parseQuestions, buildQuestionAiExport, buildAiPromptText, captureAiQuestions, requestApplyAnswers, syncIframeStateToTop };');
+        if (file === 'openedu_content') code = code.replace('    boot();', 'window.__test = { parseQuestions, buildQuestionAiExport, buildAiPromptText, captureAiPage, requestApplyAnswers, syncIframeStateToTop };');
         w.eval(code);
     }
     const questions = w.__test.parseQuestions();
@@ -86,70 +86,87 @@ test('sentence paragraphs outside the narrow input wrapper are included', () => 
 });
 
 
-test('prompt defines a separate visual request and forbids any answers until images arrive', () => {
+test('prompt directs ChatGPT to the attached full page when text lacks visual context', () => {
     const p = page([]);
     try {
         const prompt = p.w.__test.buildAiPromptText([]);
-        assert.match(prompt, /"type":"visual_context_request","questionKeys"/);
-        assert.match(prompt, /НЕ отвечай ни на один вопрос/);
-        assert.match(prompt, /Не добавляй answers/);
-        assert.match(prompt, /единый полный JSON/);
+        assert.match(prompt, /openedu-full-page.pdf/);
+        assert.match(prompt, /ВСЕЙ страницы/);
+        assert.match(prompt, /найди их на страницах приложенного PDF/);
+        assert.ok(!prompt.includes('visual_context_request'));
+        assert.ok(!prompt.includes('questionKeys'));
+        assert.match(prompt, /"answers"/);
     } finally { p.dom.window.close(); }
 });
 
-test('malformed, mixed and unknown visual requests fail before any screenshot is taken', async () => {
-    const p = page([]);
-    try {
-        for (const request of [{}, { questionKeys: [] }, { questionKeys: [42] }, { questionKeys: ['Q1'], answers: [] }, { questionKeys: ['unknown'] }]) {
-            await assert.rejects(p.w.__test.captureAiQuestions(request, []), /Invalid visual context|Unknown question/);
-        }
-    } finally { p.dom.window.close(); }
-});
-
-function capturePage(height = 1500) {
-    const p = page(['<fieldset><legend>Read the chart</legend><img src="chart.png"><input type="radio" name="choice" id="choice" value="a"><label for="choice">Alpha</label></fieldset>']);
-    const w = p.w, crops = [], captures = [];
+function capturePage(width = 1600, height = 1500) {
+    const p = page(['<fieldset><legend>Read the chart</legend><input type="radio" name="choice" id="choice" value="a"><label for="choice">Alpha</label></fieldset>']);
+    const w = p.w, crops = [], captures = [], canvases = [];
     w.setTimeout = callback => { queueMicrotask(callback); return 0; };
-    w.HTMLElement.prototype.scrollIntoView = function () {};
-    w.scrollBy = ({ top, left }) => {
-        w.scrollY = Math.max(0, Math.min(height - 500, w.scrollY + top));
-        w.scrollX = Math.max(0, w.scrollX + left);
-    };
-    w.scrollTo = ({ top, left }) => { w.scrollY = top; w.scrollX = left; };
-    const block = w.document.querySelector('.problems-wrapper');
-    block.getBoundingClientRect = () => ({ left: 10 - w.scrollX, top: 100 - w.scrollY, right: 810 - w.scrollX, bottom: 100 + height - w.scrollY, width: 800, height });
+    Object.defineProperties(w, { innerWidth: { value: 800 }, innerHeight: { value: 500 }, devicePixelRatio: { value: 2 } });
+    Object.defineProperties(w.document.documentElement, { scrollWidth: { value: width }, scrollHeight: { value: height } });
+    w.scrollTo = ({ top, left }) => { w.scrollY = Math.max(0, Math.min(height - 500, top)); w.scrollX = Math.max(0, Math.min(width - 800, left)); };
+    w.scrollTo({ top: 70, left: 50 });
     w.Image = class {
-        constructor() { this.naturalWidth = 2048; this.naturalHeight = 1536; }
+        constructor() { this.naturalWidth = 1600; this.naturalHeight = 1000; }
         set src(value) { queueMicrotask(() => this.onload()); }
     };
-    w.HTMLCanvasElement.prototype.getContext = () => ({ drawImage(...args) { crops.push(args.slice(1)); } });
-    w.HTMLCanvasElement.prototype.toDataURL = () => 'data:image/png;base64,YQ==';
+    w.HTMLCanvasElement.prototype.getContext = function () { canvases.push(this); return { drawImage(...args) { crops.push(args.slice(1)); } }; };
+    w.ParamExtOpeneduPagePdf = { async create() { return { name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }; } };
     w.chrome.runtime.sendMessage = async message => { captures.push(message); return { dataUrl: 'data:image/png;base64,YQ==' }; };
-    return { ...p, crops, captures };
+    return { ...p, crops, captures, canvases };
 }
 
-test('capture tiles only the requested question, scales crops for device pixels and restores scrolling', async () => {
+test('the entire page is stitched horizontally and vertically for one lossless PDF at device resolution', async () => {
     const p = capturePage();
     try {
-        const key = p.questions[0].questionKey;
-        const images = await p.w.__test.captureAiQuestions({ questionKeys: [key, key] }, [{ question: p.questions[0] }]);
-        assert.equal(images.length, 3);
-        assert.equal(p.captures.length, 3, 'duplicate question IDs must not duplicate screenshots');
-        assert.equal(p.crops.length, 3);
-        assert.equal(p.crops[0][2], 1600, '800 CSS pixels are cropped at 2x device scale');
-        assert.ok(images.every(image => image.name.startsWith('question-' + key + '-')));
-        assert.equal(p.w.scrollY, 0);
-        assert.equal(p.w.scrollX, 0);
+        const images = await p.w.__test.captureAiPage();
+        assert.equal(images.length, 1);
+        assert.equal(images[0].name, 'openedu-full-page.pdf');
+        assert.equal(p.captures.length, 12);
+        assert.equal(p.canvases[0].width, 3200);
+        assert.equal(p.canvases[0].height, 3000);
+        assert.equal(p.crops.reduce((area, crop) => area + crop[6] * crop[7], 0), 3200 * 3000, 'all page pixels are covered exactly once');
+        assert.equal(p.crops[0][2], 1440, '720 CSS pixels are copied at native 2x device scale');
+        assert.equal(p.w.scrollY, 70);
+        assert.equal(p.w.scrollX, 50);
     } finally { p.dom.window.close(); }
 });
 
-test('failed screenshot capture restores course scrolling and does not return partial images', async () => {
+test('long full-page captures have no twelve-tile limit', async () => {
+    const p = capturePage(800, 6500);
+    try {
+        const images = await p.w.__test.captureAiPage();
+        assert.equal(images.length, 1);
+        assert.ok(p.captures.length > 12);
+        assert.equal(p.canvases[0].height, 13000);
+        assert.equal(p.crops.reduce((area, crop) => area + crop[6] * crop[7], 0), 1600 * 13000);
+    } finally { p.dom.window.close(); }
+});
+
+test('failed full-page capture restores course scrolling and does not return a partial image', async () => {
     const p = capturePage();
     try {
         p.w.chrome.runtime.sendMessage = async () => ({ error: 'capture unavailable' });
-        await assert.rejects(p.w.__test.captureAiQuestions({ questionKeys: [p.questions[0].questionKey] }, [{ question: p.questions[0] }]), /capture unavailable/);
-        assert.equal(p.w.scrollY, 0);
-        assert.equal(p.w.scrollX, 0);
+        await assert.rejects(p.w.__test.captureAiPage(), /capture unavailable/);
+        assert.equal(p.w.scrollY, 70);
+        assert.equal(p.w.scrollX, 50);
+    } finally { p.dom.window.close(); }
+});
+
+test('a clipped course frame fails instead of sending an incomplete PDF and restores scrolling', async () => {
+    const p = capturePage();
+    try {
+        const request = p.w.ParamExtOpeneduCaptureFrames.request;
+        p.w.ParamExtOpeneduCaptureFrames.request = async (session, action, payload) => {
+            const value = await request(session, action, payload);
+            if (action === 'map') value.localRect = { ...value.localRect, right: value.localRect.right - 20 };
+            return value;
+        };
+        await assert.rejects(p.w.__test.captureAiPage(), /clipped by its course frame/);
+        assert.equal(p.captures.length, 0);
+        assert.equal(p.w.scrollY, 70);
+        assert.equal(p.w.scrollX, 50);
     } finally { p.dom.window.close(); }
 });
 

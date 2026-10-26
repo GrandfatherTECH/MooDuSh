@@ -342,17 +342,7 @@ test('configured longer timeout allows a response after the former ten-minute de
 });
 
 
-test('visual context JSON is returned without waiting for or fabricating answers', async () => {
-    const payload = { type: 'visual_context_request', questionKeys: ['Q2'], reason: 'Need the graph' };
-    const c = chat({ reply: () => JSON.stringify(payload) });
-    try {
-        c.deliver(); await c.advance(6500);
-        assert.deepEqual(JSON.parse(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').text), payload);
-        assert.equal(c.sends, 1);
-    } finally { c.dom.window.close(); }
-});
-
-function mockImageUpload(c, confirm = true, accept = 'image/*') {
+function mockDocumentUpload(c, confirm = true, accept = '.pdf,.txt') {
     class Transfer {
         constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; }
     }
@@ -362,12 +352,12 @@ function mockImageUpload(c, confirm = true, accept = 'image/*') {
     input.addEventListener('change', () => {
         if (!confirm) return;
         for (const file of input.files) {
-            if (file.type === 'text/plain') {
+            if (['text/plain', 'application/pdf'].includes(file.type)) {
                 // Document chips use plain text and an icon, outside the form;
                 // they need neither an img nor an attachment data-testid.
                 const card = c.w.document.createElement('div');
                 const name = c.w.document.createElement('span'); name.textContent = file.name.replace(/\.txt$/, '');
-                const type = c.w.document.createElement('span'); type.textContent = 'TXT';
+                const type = c.w.document.createElement('span'); type.textContent = file.type === 'application/pdf' ? 'PDF' : 'TXT';
                 const remove = c.w.document.createElement('button'); remove.type = 'button'; remove.setAttribute('aria-label', 'Remove');
                 card.append(name, type, remove); c.w.document.body.appendChild(card);
             } else {
@@ -401,9 +391,9 @@ function uploadedCards(c, files) {
 
 test('saved composer retries an unhandled native selection until ChatGPT consumes the full request', async () => {
     const c = chat({ contenteditable: true, savedComposer: true, paragraphEdits: true,
-        images: [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+        attachments: [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }] });
     try {
-        mockImageUpload(c, false).remove(); // Install DataTransfer, not another picker.
+        mockDocumentUpload(c, false).remove(); // Install DataTransfer, not another picker.
         const input = c.w.document.querySelector('input[aria-label="Attach files"]');
         nativePickerSelection(input);
         const selected = [], events = [];
@@ -417,7 +407,7 @@ test('saved composer retries an unhandled native selection until ChatGPT consume
         assert.equal(selected.length, 1, 'only one selection is consumed by the application');
         assert.equal(selected[0].length, 2);
         assert.equal(selected[0][0].name, 'moodush-questions-saved-upload.txt');
-        assert.equal(selected[0][1].name, 'question-Q1-1.png');
+        assert.equal(selected[0][1].name, 'openedu-full-page.pdf');
         assert.ok(events.length > 2, 'the first unhandled selection must be retried');
         assert.deepEqual(events.slice(0, 2), ['input', 'change']);
         const text = await new Promise(resolve => {
@@ -432,7 +422,7 @@ test('saved composer retries an unhandled native selection until ChatGPT consume
 test('saved composer reacquires a picker replaced by the input event before change', async () => {
     const c = chat({ contenteditable: true, savedComposer: true });
     try {
-        mockImageUpload(c, false).remove();
+        mockDocumentUpload(c, false).remove();
         const original = c.w.document.querySelector('input[aria-label="Attach files"]');
         nativePickerSelection(original);
         let staleChanges = 0, accepted = 0;
@@ -454,7 +444,7 @@ test('saved composer reacquires a picker replaced by the input event before chan
 test('an ignored native file selection fails explicitly without waiting for nonexistent attachments', async () => {
     const c = chat({ contenteditable: true, savedComposer: true });
     try {
-        mockImageUpload(c, false).remove();
+        mockDocumentUpload(c, false).remove();
         nativePickerSelection(c.w.document.querySelector('input[aria-label="Attach files"]'));
         c.deliver('ignored-selection', 'questions '.repeat(2000)); await c.advance(6500);
         assert.equal(c.sends, 0);
@@ -462,26 +452,26 @@ test('an ignored native file selection fails explicitly without waiting for none
     } finally { c.dom.window.close(); }
 });
 
-test('follow-up sends only after the screenshot attachments appear in the composer', async () => {
-    const images = [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
-    const c = chat({ images });
+test('the answer request sends only after the full-page screenshot appears in the composer', async () => {
+    const attachments = [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }];
+    const c = chat({ attachments });
     try {
-        const input = mockImageUpload(c);
-        c.deliver('followup', 'Return all answers'); await c.advance(8000);
+        const input = mockDocumentUpload(c);
+        c.deliver('full-page', 'Return all answers'); await c.advance(8000);
         assert.equal(input.files.length, 1);
-        assert.equal(input.files[0].name, images[0].name);
+        assert.equal(input.files[0].name, attachments[0].name);
         assert.equal(c.sends, 1);
         assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').text, '{"answers":[]}');
     } finally { c.dom.window.close(); }
 });
 
-test('an unconfirmed screenshot upload stops before sending the follow-up', async () => {
-    const c = chat({ images: [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+test('an unconfirmed full-page upload stops before sending the answer request', async () => {
+    const c = chat({ attachments: [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }] });
     try {
-        mockImageUpload(c, false);
+        mockDocumentUpload(c, false);
         c.deliver(); await c.advance(62000);
         assert.equal(c.sends, 0);
-        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').error, /confirm screenshot attachments/);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').error, /confirm PDF attachment/);
     } finally { c.dom.window.close(); }
 });
 
@@ -502,15 +492,15 @@ test('large matching prompts are acknowledged before composer work and are sent 
 });
 
 test('large rich-editor prompts are uploaded intact as text files with a short composer message', async () => {
-    const c = chat({ contenteditable: true, paragraphEdits: true, images: [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+    const c = chat({ contenteditable: true, paragraphEdits: true, attachments: [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }] });
     const prompt = 'Original full instructions and questions: ' + 'x'.repeat(94000);
     try {
-        const input = mockImageUpload(c, true, '*/*');
+        const input = mockDocumentUpload(c, true, '*/*');
         c.deliver('large-file', prompt); await c.advance(9000);
         assert.equal(c.sends, 1);
         assert.ok(c.inserted.every(text => text.length < 1000), 'the rich editor must never receive the large payload');
         assert.equal(input.files.length, 2);
-        assert.equal(input.files[1].name, 'question-Q1-1.png');
+        assert.equal(input.files[1].name, 'openedu-full-page.pdf');
         assert.equal(input.files[0].type, 'text/plain');
         assert.equal(input.files[0].name, 'moodush-questions-large-file.txt');
         const text = await new Promise((resolve, reject) => {
@@ -522,17 +512,17 @@ test('large rich-editor prompts are uploaded intact as text files with a short c
     } finally { c.dom.window.close(); }
 });
 
-test('lazy attachment menu mounts separate document and image inputs before mixed upload', async () => {
-    const c = chat({ contenteditable: true, images: [{ name: 'question-Q1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+test('lazy attachment menu mounts separate text and PDF inputs before mixed upload', async () => {
+    const c = chat({ contenteditable: true, attachments: [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }] });
     try {
-        const documents = mockImageUpload(c, true, '.txt'); documents.remove();
-        const images = mockImageUpload(c, true, 'image/*'); images.remove();
+        const documents = mockDocumentUpload(c, true, '.txt'); documents.remove();
+        const attachments = mockDocumentUpload(c, true, 'application/pdf'); attachments.remove();
         const add = c.w.document.createElement('button'); add.type = 'button'; add.dataset.testid = 'composer-plus-btn';
         let menuClicks = 0, pasteEvents = 0;
         c.w.document.addEventListener('paste', () => pasteEvents++);
         add.onclick = () => {
             const item = c.w.document.createElement('button'); item.setAttribute('role', 'menuitem'); item.textContent = 'Add photos & files';
-            item.onclick = () => { menuClicks++; c.w.document.querySelector('form').append(documents, images); item.remove(); };
+            item.onclick = () => { menuClicks++; c.w.document.querySelector('form').append(documents, attachments); item.remove(); };
             c.w.document.body.appendChild(item);
         };
         c.w.document.querySelector('form').appendChild(add);
@@ -542,21 +532,21 @@ test('lazy attachment menu mounts separate document and image inputs before mixe
         assert.equal(pasteEvents, 0, 'documents must use the document upload handler');
         assert.equal(documents.files.length, 1);
         assert.equal(documents.files[0].name, 'moodush-questions-lazy-files.txt');
-        assert.equal(images.files.length, 1);
-        assert.equal(images.files[0].name, 'question-Q1.png');
+        assert.equal(attachments.files.length, 1);
+        assert.equal(attachments.files[0].name, 'openedu-full-page.pdf');
         assert.equal(c.sends, 1);
         assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
     } finally { c.dom.window.close(); }
 });
 
-test('a single-file picker uploads screenshots one at a time', async () => {
-    const c = chat({ images: [1, 2].map(n => ({ name: 'question-' + n + '.png', dataUrl: 'data:image/png;base64,YQ==' })) });
+test('a single-file picker uploads documents one at a time', async () => {
+    const c = chat({ attachments: [1, 2].map(n => ({ name: 'page-' + n + '.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' })) });
     try {
-        const input = mockImageUpload(c); input.multiple = false;
+        const input = mockDocumentUpload(c); input.multiple = false;
         const batches = [];
         input.addEventListener('change', () => batches.push([...input.files].map(file => file.name)));
         c.deliver(); await c.advance(9000);
-        assert.deepEqual(batches, [['question-1.png'], ['question-2.png']]);
+        assert.deepEqual(batches, [['page-1.pdf'], ['page-2.pdf']]);
         assert.equal(c.sends, 1);
     } finally { c.dom.window.close(); }
 });
@@ -564,7 +554,7 @@ test('a single-file picker uploads screenshots one at a time', async () => {
 test('upload waits for a document input mounted after the prompt editor updates', async () => {
     const c = chat({ contenteditable: true });
     try {
-        const input = mockImageUpload(c, true, '.txt'); input.remove();
+        const input = mockDocumentUpload(c, true, '.txt'); input.remove();
         c.w.document.querySelector('#prompt-textarea').addEventListener('input', () => {
             c.w.setTimeout(() => c.w.document.querySelector('form').appendChild(input), 300);
         });
@@ -590,11 +580,11 @@ test('missing document picker reports the upload stage without silently pasting 
 test('failed large-prompt upload stops visibly and never falls back to a giant editor insertion', async () => {
     const c = chat({ contenteditable: true, paragraphEdits: true });
     try {
-        mockImageUpload(c, false, '*/*');
+        mockDocumentUpload(c, false, '*/*');
         c.deliver('upload-failed', 'x'.repeat(94000)); await c.advance(62000);
         assert.equal(c.sends, 0);
         assert.ok(c.inserted.every(text => text.length < 1000));
-        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /confirm screenshot attachments or prompt file/);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /confirm PDF attachment or prompt file/);
     } finally { c.dom.window.close(); }
 });
 
@@ -654,7 +644,7 @@ test('streaming assistant trees are not cloned while waiting for the final respo
 test('text-file chips outside the form send despite unrelated composer aria-busy state', async () => {
     const c = chat({ contenteditable: true });
     try {
-        mockImageUpload(c, true, '.txt');
+        mockDocumentUpload(c, true, '.txt');
         c.w.document.querySelector('form').setAttribute('aria-busy', 'true');
         c.deliver('plain-chip', 'questions '.repeat(2000)); await c.advance(9000);
         assert.equal(c.sends, 1);
@@ -667,7 +657,7 @@ test('text-file chips outside the form send despite unrelated composer aria-busy
 test('a document filename split across nested spans still confirms the attachment', async () => {
     const c = chat({ contenteditable: true });
     try {
-        const input = mockImageUpload(c, false, '.txt');
+        const input = mockDocumentUpload(c, false, '.txt');
         input.addEventListener('change', () => {
             const card = c.w.document.createElement('div');
             const name = c.w.document.createElement('div');
@@ -685,7 +675,7 @@ test('a document filename split across nested spans still confirms the attachmen
 test('upload progress next to the form delays sending until the file finishes', async () => {
     const c = chat({ contenteditable: true });
     try {
-        mockImageUpload(c, true, '.txt');
+        mockDocumentUpload(c, true, '.txt');
         const progress = c.w.document.createElement('div'); progress.setAttribute('role', 'progressbar');
         c.w.document.body.appendChild(progress);
         c.deliver('upload-progress', 'questions '.repeat(2000)); await c.advance(3000);
@@ -698,7 +688,7 @@ test('upload progress next to the form delays sending until the file finishes', 
 test('a filename mentioned only in conversation history cannot confirm an absent upload', async () => {
     const c = chat({ contenteditable: true });
     try {
-        mockImageUpload(c, false, '.txt');
+        mockDocumentUpload(c, false, '.txt');
         const previous = c.w.document.createElement('article'); previous.setAttribute('data-message-author-role', 'assistant');
         previous.textContent = 'moodush-questions-history-only.txt'; c.w.document.body.appendChild(previous);
         c.deliver('history-only', 'questions '.repeat(2000)); await c.advance(62000);
@@ -710,7 +700,7 @@ test('a filename mentioned only in conversation history cannot confirm an absent
 test('upload can replace the composer and sending uses the replacement editor', async () => {
     const c = chat({ contenteditable: true });
     try {
-        const input = mockImageUpload(c, true, '.txt');
+        const input = mockDocumentUpload(c, true, '.txt');
         input.addEventListener('change', () => {
             const old = c.w.document.querySelector('#prompt-textarea');
             const text = old.textContent; old.closest('form').remove();
@@ -726,7 +716,7 @@ test('upload can replace the composer and sending uses the replacement editor', 
 test('an explicit upload failure stops sending even when the filename and send button exist', async () => {
     const c = chat({ contenteditable: true });
     try {
-        const input = mockImageUpload(c, true, '.txt');
+        const input = mockDocumentUpload(c, true, '.txt');
         input.addEventListener('change', () => {
             const card = [...c.w.document.body.children].find(node => node.id !== 'moodush-chatgpt-status' && node.textContent.includes('moodush-questions-upload-error') && node.tagName === 'DIV');
             card.appendChild(c.w.document.createTextNode(' Upload failed'));
@@ -740,7 +730,7 @@ test('an explicit upload failure stops sending even when the filename and send b
 test('file chips remain visible to confirmation when the active composer is inside a Work turn', async () => {
     const c = chat({ contenteditable: true });
     try {
-        const input = mockImageUpload(c, true, '.txt');
+        const input = mockDocumentUpload(c, true, '.txt');
         const turn = c.w.document.createElement('section'); turn.setAttribute('data-turn-key', 'active-work-turn');
         c.w.document.body.appendChild(turn); turn.appendChild(c.w.document.querySelector('form'));
         input.addEventListener('change', () => {
@@ -756,12 +746,12 @@ test('file chips remain visible to confirmation when the active composer is insi
 test('retry replaces its own failed file-upload draft when the new request gets a new filename', async () => {
     const c = chat({ contenteditable: true });
     try {
-        const failedInput = mockImageUpload(c, false, '.txt');
+        const failedInput = mockDocumentUpload(c, false, '.txt');
         const prompt = 'questions '.repeat(2000);
         c.deliver('failed-old', prompt); await c.advance(62000);
         assert.equal(c.sends, 0);
         assert.ok(c.w.document.querySelector('#prompt-textarea').textContent.includes('moodush-questions-failed-old.txt'));
-        failedInput.remove(); mockImageUpload(c, true, '.txt');
+        failedInput.remove(); mockDocumentUpload(c, true, '.txt');
         c.deliver('retry-new', prompt); await c.advance(9000);
         assert.equal(c.sends, 1);
         assert.ok(c.inserted.at(-1).includes('moodush-questions-retry-new.txt'));

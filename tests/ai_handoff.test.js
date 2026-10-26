@@ -62,6 +62,16 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
             })) });
         }
     });
+    c.w.DataTransfer = class { constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; } };
+    const upload = c.w.document.createElement('input');
+    upload.type = 'file'; upload.multiple = true; upload.accept = '.pdf,.txt';
+    Object.defineProperty(upload, 'files', { value: [], writable: true });
+    upload.addEventListener('change', () => {
+        for (const file of upload.files) {
+            const card = c.w.document.createElement('div'); card.dataset.fileId = 'uploaded-' + file.name; card.textContent = file.name; c.w.document.querySelector('form').appendChild(card);
+        }
+    });
+    c.w.document.querySelector('form').appendChild(upload);
     const session = {};
     const backgroundChrome = {
         runtime: { getURL: path => 'chrome-extension://extension/' + path, onMessage: { addListener(fn) { workerListeners.push(fn); } } },
@@ -69,16 +79,18 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
             async get(keys) { const out = {}; for (const key of Array.isArray(keys) ? keys : [keys]) out[key] = session[key]; return out; },
             async set(value) { Object.assign(session, value); }, async remove(key) { delete session[key]; }
         } },
+        windows: { async update() {} },
         tabs: {
             async create(properties) {
                 if (properties.url.startsWith('chrome-extension://')) { const tab = { id: 21, ...properties }; reminderTabs.push(tab); return tab; }
                 opened++; return { id: 20, url: 'https://chatgpt.com/', status: 'loading' };
             },
-            async query() { return reminderTabs; },
-            async get() { return { id: 20, url: 'https://chatgpt.com/', status: 'complete' }; },
+            async query(options) { return options?.active ? [{ id: 3 }] : reminderTabs; },
+            async get(id) { return { id, windowId: 1, url: id === 3 ? w.location.href : 'https://chatgpt.com/', status: 'complete' }; },
+            async captureVisibleTab() { return 'data:image/png;base64,YQ=='; },
             async update() {},
             async sendMessage(tab, message) {
-                if (tab === 20) return c.deliver(message.job.id, message.job.prompt);
+                if (tab === 20) return c.deliver(message.job.id, message.job.prompt, message.job.answerTimeoutMs, { attachments: message.job.attachments });
                 for (const listener of sourceListeners) listener(message, { id: chromeId }, () => {});
             },
             onUpdated: { addListener() {} }, onRemoved: { addListener() {} }
@@ -89,7 +101,8 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
     const legacy = commons.match(/runtime\.onMessage\.addListener\((.*?)\)\}async messageHandler/s)[1];
     workerListeners.push(Function('return ' + legacy).call({ messageHandler: async () => ({ error_type: true }) }));
     vm.runInNewContext(fs.readFileSync(require.resolve('../js/ai_background.js'), 'utf8'), {
-        chrome: backgroundChrome, crypto: require('node:crypto').webcrypto, URL, setTimeout
+        indexedDB: new (require('fake-indexeddb').IDBFactory)(),
+        chrome: backgroundChrome, crypto: require('node:crypto').webcrypto, URL, setTimeout: (callback, delay) => delay === 600 ? setImmediate(callback) : setTimeout(callback, delay)
     });
     w.chrome = {
         runtime: { id: chromeId, getManifest: () => ({ version: 'test' }), onMessage: { addListener(fn) { sourceListeners.push(fn); } }, sendMessage: message => route(message, sourceSender) },
@@ -111,6 +124,15 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
         const answer = JSON.parse(event.target.value).answer;
         w.document.querySelector('.submit').disabled = Object.keys(answer).length !== 9;
     });
+    const nativeTimeout = w.setTimeout.bind(w);
+    w.setTimeout = (callback, delay, ...args) => delay === 150 ? (queueMicrotask(callback), 0) : nativeTimeout(callback, delay, ...args);
+    w.scrollTo = ({ left, top }) => { w.scrollX = left; w.scrollY = top; };
+    w.Image = class {
+        constructor() { this.naturalWidth = 1024; this.naturalHeight = 768; }
+        set src(value) { queueMicrotask(() => this.onload()); }
+    };
+    w.HTMLCanvasElement.prototype.getContext = () => ({ drawImage() {} });
+    w.HTMLCanvasElement.prototype.toDataURL = () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
     w.fetch = async () => ({ ok: false, status: 404 });
     w.HTMLElement.prototype.getBoundingClientRect = () => ({ width: 800, height: 30, top: 0, left: 0 });
     w.addEventListener('error', e => errors.push(e.message));
@@ -133,7 +155,8 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
         const manifest = JSON.parse(fs.readFileSync(require.resolve('../manifest.json'), 'utf8'));
         const scripts = manifest.content_scripts.find(s => s.js?.includes('js/openedu_content.js')).js;
         for (const script of scripts) w.eval(fs.readFileSync(require('node:path').join(__dirname, '..', script), 'utf8'));
-        for (let i = 0; i < 10; i++) await flush();
+        for (let i = 0; i < 100 && !opened; i++) await flush();
+        for (let i = 0; i < 20; i++) await flush();
         assert.equal(opened, 1, 'actual boot must open the AI tab');
         // Popup UI bookkeeping and idempotent saves used to cancel the active
         // solve even though neither the course page nor solve mode changed.
@@ -146,9 +169,11 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
         await c.advance(6000);
         for (let i = 0; i < 10; i++) await flush();
         assert.equal(c.sends, 1);
+        await c.advance(6000);
+        assert.equal(upload.files[0]?.name, 'openedu-full-page.pdf');
         assert.ok(c.inserted[0].includes(choiceType === 'matching' ? 'Author 0' : 'Choose the first option.'));
-        assert.equal(submitted, 1);
         await new Promise(resolve => setTimeout(resolve, 900));
+        assert.equal(submitted, 1, JSON.stringify({ sourceError: w.document.getElementById('moodush-ai-error')?.textContent, result: c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT'), sessionKeys: Object.keys(session), errors }));
         if (choiceType === 'mixed') {
             assert.equal(storage.moodushOpeneduReminders.length, 1);
             assert.equal(reminderTabs.length, 1);

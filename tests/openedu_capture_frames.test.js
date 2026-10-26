@@ -75,6 +75,7 @@ test('cross-origin nested frames coordinate viewport, scrolling, cropping and re
     const mapped = await f.inner.api.request('capture-1', 'map', { left: 10, top: 1180, right: 300, bottom: 1480 });
     assert.equal(mapped.width, 1200);
     assert.equal(mapped.height, 800);
+    assert.deepEqual(JSON.parse(JSON.stringify(mapped.localRect)), { left: 10, top: 1180, right: 300, bottom: 1480 });
     assert.equal(mapped.rect.top, 10);
     assert.equal(mapped.rect.bottom, 310);
     assert.ok(mapped.rect.left >= 0 && mapped.rect.right <= 1200);

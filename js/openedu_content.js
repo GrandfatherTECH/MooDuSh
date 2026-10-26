@@ -7005,122 +7005,123 @@
         else syncIframeStateToTop(lastMergedStatsByQuestion || {}, questions, topFrameOnlineState);
     }
 
-    async function captureAiQuestions(request, items) {
-        if (Object.hasOwn(request, 'answers') || !Array.isArray(request.questionKeys) || !request.questionKeys.length
-            || request.questionKeys.some(key => typeof key !== 'string')) {
-            throw new Error('Invalid visual context request: expected questionKeys without answers');
-        }
-        const selected = [...new Set(request.questionKeys)].map(key => {
-            const item = items.find(item => item.question.questionKey === key);
-            if (!item) throw new Error('Unknown question in visual context request: ' + key);
-            return item;
-        });
-        const images = [];
-        const frameSession = crypto.randomUUID();
+    async function captureAiPage(assertCurrent = () => {}) {
         const frames = window.ParamExtOpeneduCaptureFrames;
         if (!frames) throw new Error('Screenshot frame adapter is unavailable. Reload the extension and course tabs.');
-        const scrollPositions = new Map();
-        const remember = target => { if (!scrollPositions.has(target)) scrollPositions.set(target, { x: target.scrollX ?? target.scrollLeft, y: target.scrollY ?? target.scrollTop }); };
+        const session = crypto.randomUUID();
+        const original = { x: window.scrollX, y: window.scrollY };
+        const root = document.documentElement;
+        const body = document.body;
+        const hidden = [...document.querySelectorAll(PARAMEXT_WIDGET_SELECTOR + ', #moodush-ai-error')]
+            .map(node => ({ node, visibility: node.style.visibility }));
+        const expanded = [];
+        const dimensions = () => ({
+            width: Math.max(root.scrollWidth, body?.scrollWidth || 0, window.innerWidth),
+            height: Math.max(root.scrollHeight, body?.scrollHeight || 0, window.innerHeight)
+        });
         try {
-            for (const item of selected) {
-                const block = getQuestionProblemContainer(item.question);
-                if (!block?.isConnected || block.ownerDocument !== document) throw new Error('Requested question is not visible in the current course frame');
-                remember(window);
-                const viewport = await frames.request(frameSession, 'prepare');
-                block.scrollIntoView({ block: 'start', inline: 'start', behavior: 'instant' });
-                await aiPause(600);
-                const size = block.getBoundingClientRect();
-                let viewportWidth = Math.min(window.innerWidth, viewport.width), viewportHeight = Math.min(window.innerHeight, viewport.height);
-                const scrollers = [];
-                for (let parent = block.parentElement; parent && parent !== document.scrollingElement; parent = parent.parentElement) {
-                    const style = getComputedStyle(parent);
-                    if (/(auto|scroll|hidden)/.test(style.overflow + style.overflowX + style.overflowY)
-                        && (parent.scrollHeight > parent.clientHeight || parent.scrollWidth > parent.clientWidth)) {
-                        scrollers.push(parent); remember(parent);
-                        viewportWidth = Math.min(viewportWidth, parent.clientWidth);
-                        viewportHeight = Math.min(viewportHeight, parent.clientHeight);
-                    }
+            hidden.forEach(({ node }) => { node.style.visibility = 'hidden'; });
+            // Course shells sometimes put the page inside a scrolling panel.
+            // Expand those panels temporarily so their offscreen content is included.
+            for (const node of document.querySelectorAll('body *')) {
+                if (node.closest(PARAMEXT_WIDGET_SELECTOR) || node === document.scrollingElement) continue;
+                const style = getComputedStyle(node);
+                const vertical = node.clientHeight > 0 && node.scrollHeight > node.clientHeight && /(auto|scroll)/.test(style.overflowY);
+                const horizontal = node.clientWidth > 0 && node.scrollWidth > node.clientWidth && /(auto|scroll)/.test(style.overflowX);
+                if (!vertical && !horizontal) continue;
+                expanded.push({ node, style: node.getAttribute('style') });
+                if (vertical) {
+                    node.style.setProperty('height', node.scrollHeight + node.offsetHeight - node.clientHeight + 'px', 'important');
+                    node.style.setProperty('max-height', 'none', 'important');
                 }
-                const stepX = Math.max(1, viewportWidth - 80), stepY = Math.max(1, viewportHeight - 100);
-                let part = 0;
-                for (let y = 0; y < size.height; y += stepY) {
-                    for (let x = 0; x < size.width; x += stepX) {
-                        if (images.length >= 12) throw new Error('Requested questions need more than 12 screenshots');
-                        for (const parent of scrollers) {
-                            const rect = block.getBoundingClientRect(), parentRect = parent.getBoundingClientRect();
-                            parent.scrollBy({ left: rect.left + x - parentRect.left - 20, top: rect.top + y - parentRect.top - 30, behavior: 'instant' });
-                        }
-                        const rect = block.getBoundingClientRect();
-                        window.scrollBy({ left: rect.left + x - 20, top: rect.top + y - 30, behavior: 'instant' });
-                        await frames.request(frameSession, 'scroll', { x: block.getBoundingClientRect().left + x, y: block.getBoundingClientRect().top + y });
-                        await aiPause(300);
-                        const current = block.getBoundingClientRect();
-                        let left = Math.max(0, current.left), top = Math.max(0, current.top);
-                        let right = Math.min(window.innerWidth, current.right), bottom = Math.min(window.innerHeight, current.bottom);
-                        for (const parent of scrollers) {
-                            const clip = parent.getBoundingClientRect();
-                            left = Math.max(left, clip.left + parent.clientLeft); top = Math.max(top, clip.top + parent.clientTop);
-                            right = Math.min(right, clip.left + parent.clientLeft + parent.clientWidth); bottom = Math.min(bottom, clip.top + parent.clientTop + parent.clientHeight);
-                        }
-                        const mapped = await frames.request(frameSession, 'map', { left, top, right, bottom });
-                        ({ left, top, right, bottom } = mapped.rect);
-                        if (right <= left || bottom <= top) throw new Error('Requested question is outside the visible viewport');
-                        const capture = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_CAPTURE' });
-                        if (!capture?.dataUrl) throw new Error(capture?.error || 'Screenshot capture failed');
-                        const bitmap = new Image();
-                        await new Promise((resolve, reject) => { bitmap.onload = resolve; bitmap.onerror = () => reject(new Error('Invalid screenshot')); bitmap.src = capture.dataUrl; });
-                        const scaleX = bitmap.naturalWidth / mapped.width, scaleY = bitmap.naturalHeight / mapped.height;
-                        const canvas = document.createElement('canvas');
-                        canvas.width = Math.round((right - left) * scaleX); canvas.height = Math.round((bottom - top) * scaleY);
-                        canvas.getContext('2d').drawImage(bitmap, left * scaleX, top * scaleY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
-                        images.push({ name: 'question-' + item.question.questionKey.replace(/[^A-Za-z0-9_-]/g, '_') + '-' + (++part) + '.png', dataUrl: canvas.toDataURL('image/png') });
-                        if (images.reduce((size, image) => size + image.dataUrl.length, 0) > 6000000) throw new Error('Question screenshots exceed the 6 MB limit');
+                if (horizontal) {
+                    node.style.setProperty('width', node.scrollWidth + node.offsetWidth - node.clientWidth + 'px', 'important');
+                    node.style.setProperty('max-width', 'none', 'important');
+                }
+                node.style.setProperty('overflow', 'visible', 'important');
+            }
+            const viewport = await frames.request(session, 'prepare');
+            const stepX = Math.max(1, Math.min(window.innerWidth, viewport.width) - 80);
+            const stepY = Math.max(1, Math.min(window.innerHeight, viewport.height) - 100);
+            const scroll = async (x, y) => {
+                assertCurrent();
+                window.scrollTo({ left: x, top: y, behavior: 'instant' });
+                await frames.request(session, 'scroll', { x: x - window.scrollX, y: y - window.scrollY });
+                await aiPause(150);
+            };
+            // Visit the whole page first so lazy-loaded illustrations can render.
+            for (let y = 0; y < dimensions().height; y += stepY) {
+                if (dimensions().width * dimensions().height * Math.max(1, window.devicePixelRatio || 1) ** 2 > 160000000) {
+                    throw new Error('The full page exceeds the browser screenshot canvas capacity. No partial screenshot was sent.');
+                }
+                await scroll(0, y);
+            }
+            if (document.fonts?.ready) await document.fonts.ready;
+            await Promise.all([...document.images].filter(image => !image.complete).map(image => Promise.race([
+                new Promise(resolve => { image.addEventListener('load', resolve, { once: true }); image.addEventListener('error', resolve, { once: true }); }),
+                aiPause(5000)
+            ])));
+            const size = dimensions();
+            const scale = Math.max(1, window.devicePixelRatio || 1);
+            if (size.width * size.height * scale * scale > 160000000) throw new Error('The full page exceeds the browser screenshot canvas capacity. No partial screenshot was sent.');
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.ceil(size.width * scale);
+            canvas.height = Math.ceil(size.height * scale);
+            const context = canvas.getContext('2d');
+            if (!context) throw new Error('The full page exceeds the browser screenshot canvas capacity. No partial screenshot was sent.');
+            context.imageSmoothingEnabled = false;
+            for (let y = 0; y < size.height; y += stepY) {
+                for (let x = 0; x < size.width; x += stepX) {
+                    await scroll(x, y);
+                    const local = {
+                        left: x - window.scrollX, top: y - window.scrollY,
+                        right: Math.min(size.width, x + stepX) - window.scrollX,
+                        bottom: Math.min(size.height, y + stepY) - window.scrollY
+                    };
+                    const mapped = await frames.request(session, 'map', local);
+                    const visible = mapped.localRect;
+                    if (!visible || visible.right - visible.left < local.right - local.left - 1
+                        || visible.bottom - visible.top < local.bottom - local.top - 1) {
+                        throw new Error('Part of the full page is clipped by its course frame. No partial screenshot was sent.');
                     }
+                    const capture = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_CAPTURE' });
+                    if (!capture?.dataUrl) throw new Error(capture?.error || 'Full-page screenshot capture failed');
+                    const bitmap = new Image();
+                    await new Promise((resolve, reject) => { bitmap.onload = resolve; bitmap.onerror = () => reject(new Error('Invalid screenshot')); bitmap.src = capture.dataUrl; });
+                    const rect = mapped.rect;
+                    const scaleX = bitmap.naturalWidth / mapped.width, scaleY = bitmap.naturalHeight / mapped.height;
+                    context.drawImage(bitmap, rect.left * scaleX, rect.top * scaleY,
+                        (rect.right - rect.left) * scaleX, (rect.bottom - rect.top) * scaleY,
+                        (visible.left + window.scrollX) * scale, (visible.top + window.scrollY) * scale,
+                        (visible.right - visible.left) * scale, (visible.bottom - visible.top) * scale);
                 }
             }
+            if (!window.ParamExtOpeneduPagePdf) throw new Error('PDF encoder is unavailable. Reload the extension and course tabs.');
+            return [await window.ParamExtOpeneduPagePdf.create(canvas)];
         } finally {
-            await frames.request(frameSession, 'restore').catch(error => debugSync('ai_screenshot_restore_failed', { error: error.message }));
-            for (const [win, position] of scrollPositions) win.scrollTo({ left: position.x, top: position.y, behavior: 'instant' });
-        }
-        if (!images.length) throw new Error('No question screenshots were captured');
-        return images;
-    }
-
-    async function requestChatgpt(prompt, items, feedback = '') {
-        let response = await requestChatgptOnce(prompt);
-        let images = [];
-        const supplied = new Set();
-        for (let round = 0; ; round++) {
-            const value = JSON.parse(response);
-            if (value?.type !== 'visual_context_request') return response;
-            if (Object.hasOwn(value, 'answers') || !Array.isArray(value.questionKeys) || !value.questionKeys.length
-                || value.questionKeys.some(key => typeof key !== 'string' || !items.some(item => item.question.questionKey === key))) {
-                throw new Error('Invalid visual context request: expected current questionKeys without answers');
+            await frames.request(session, 'restore').catch(error => debugSync('ai_screenshot_restore_failed', { error: error.message }));
+            for (const { node, style } of expanded.reverse()) {
+                if (style === null) node.removeAttribute('style'); else node.setAttribute('style', style);
             }
-            if (round >= 3) {
-                throw new Error('ChatGPT could not read the visual context after 3 screenshot follow-ups ('
-                    + value.questionKeys.join(', ') + '): ' + String(value.reason || 'No reason provided').slice(0, 500)
-                    + '. No answers were applied. Use Retry after checking the screenshots.');
-            }
-            const missing = [...new Set(value.questionKeys)].filter(key => !supplied.has(key));
-            reportAiWorkflowStatus(missing.length ? 'снимки запрошенных вопросов' : 'повторный запрос ответов по приложенным снимкам', false);
-            if (missing.length) {
-                images = images.concat(await captureAiQuestions({ ...value, questionKeys: missing }, items));
-                missing.forEach(key => supplied.add(key));
-            }
-            if (images.length > 12 || images.reduce((size, image) => size + image.dataUrl.length, 0) > 6000000) {
-                throw new Error('Question screenshots exceed the combined limit of 12 images / 6 MB');
-            }
-            // Build this stage afresh: do not repeat the initial instruction to
-            // request screenshots before answering. Retain grading/repair feedback.
-            const followup = buildAiPromptText(items, { visualContext: {
-                questionKeys: [...supplied], fileNames: images.map(image => image.name), reason: String(value.reason || '').slice(0, 500)
-            } }) + feedback;
-            response = await requestChatgptOnce(followup, images);
+            window.scrollTo({ left: original.x, top: original.y, behavior: 'instant' });
+            hidden.forEach(({ node, visibility }) => { node.style.visibility = visibility; });
         }
     }
 
-    function requestChatgptOnce(prompt, images = []) {
+    async function requestChatgpt(prompt) {
+        reportAiWorkflowStatus('PDF всей страницы', false);
+        const generation = aiGeneration;
+        const section = aiSectionKey(aiLocalQuestions());
+        const assertCurrent = () => {
+            if (generation !== aiGeneration || !isChatgptAutoMode() || shouldSkipUnsupportedPage()
+                || aiSectionKey(aiLocalQuestions()) !== section) throw new Error('PDF capture stopped because the page or mode changed');
+        };
+        const attachments = await captureAiPage(assertCurrent);
+        assertCurrent();
+        return requestChatgptOnce(prompt, attachments);
+    }
+
+    function requestChatgptOnce(prompt, attachments = []) {
         return new Promise(async (resolve, reject) => {
             try {
                 // Freeze this request's setting; later edits apply to the next request.
@@ -7129,7 +7130,7 @@
                 let response;
                 const deadline = Date.now() + requestTimeoutMs;
                 do {
-                    response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_REQUEST', prompt, images, answerTimeoutMs });
+                    response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_REQUEST', prompt, attachments, answerTimeoutMs });
                     if (!response?.busy) break;
                     await aiPause(2000);
                 } while (Date.now() < deadline && isChatgptAutoMode());
@@ -7234,7 +7235,7 @@
                 let extra = round ? '\nПредыдущие попытки (только вопросы с оставшимися попытками): ' + JSON.stringify(wireFeedback)
                     + '\nВопросы wrong — неверно. Исправь их; не повторяй прежние неверные ответы.' : '';
                 for (let repair = 0; repair < 3; repair++) {
-                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra, requestItems, extra);
+                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra);
                     assertCurrent();
                     try {
                         const entries = window.ParamExtOpeneduAi.parseResponse(response,
@@ -7942,22 +7943,16 @@
         });
     }
 
-    function buildAiPromptText(items, { visualContext = null } = {}) {
+    function buildAiPromptText(items, { screenshotAttached = true } = {}) {
         const payload = buildQuestionAiExport(items);
         return [
             'Ниже список вопросов OpenEdu. Нужно определить правильные ответы.',
             'Используй options как список доступных вариантов. knownAnswers.verified уже подтверждены платформой, knownAnswers.popular могут быть подсказкой, knownAnswers.incorrect выбирать нельзя.',
-            ...(visualContext ? [
-                'Это этап ответа ПОСЛЕ получения снимков. Изображения из списка ниже приложены к ЭТОМУ сообщению. Рассматривай все части одного вопроса вместе; используй сами изображения, а не только их имена, ссылки или alt-текст.',
-                'Используй снимки и весь исходный список ниже. Теперь верни один полный объединённый JSON {"answers":[...]} с ответами на КАЖДЫЙ вопрос исходного списка, включая вопросы без снимков.',
-                'Не запрашивай снимки заново лишь потому, что JSON вопроса содержит ссылку на изображение: проверь соответствующие вложения. Если конкретный снимок действительно отсутствует или нечитаем, верни только visual_context_request с questionKeys и точной причиной; не угадывай ответы.',
-                'Уже приложенный визуальный контекст: ' + JSON.stringify(visualContext)
-            ] : [
-                'Сначала проверь, достаточно ли визуальной информации для ВСЕХ вопросов. Ссылки, имена файлов и alt-текст не заменяют изображения, графики, схемы или формулы.',
-                'Если для хотя бы одного вопроса недостаточно визуальной информации, НЕ отвечай ни на один вопрос на этом этапе. Верни ТОЛЬКО отдельный JSON следующего вида:',
-                '{"type":"visual_context_request","questionKeys":["точный questionKey нужного вопроса"],"reason":"какая визуальная информация нужна"}',
-                'Перечисли все вопросы, которым нужны снимки, в questionKeys. Не добавляй answers и не угадывай ответы. Расширение пришлёт снимки, после чего потребуется единый полный JSON ответов на весь исходный список.',
-            ]),
+            screenshotAttached
+                ? 'К этому сообщению по умолчанию приложен openedu-full-page.pdf — PDF со снимком ВСЕЙ страницы OpenEdu в исходном разрешении, включая содержимое ниже видимой области.'
+                : 'Для визуального контекста используй полный снимок страницы OpenEdu, если он приложен.',
+            'Если в JSON не хватает условий, рисунков, графиков, формул, таблиц или вариантов ответа, найди их на страницах приложенного PDF. Рассматривай сами страницы PDF, а не только ссылки, имена файлов или alt-текст.',
+            'Сопоставь вопросы со страницами PDF по тексту и порядку. Верни один полный JSON ответов на все вопросы текущего списка.',
             'Если информации достаточно, верни только валидный JSON без markdown. Формат ответов строго такой:',
             '{"answers":[{"index":1,"questionKey":"...","answers":[{"answerKey":"...","answerText":"точный текст ответа"}]}]}',
             'Копируй questionKey и index точно из каждого вопроса текущего списка. Не используй ID из предыдущих сообщений.',
@@ -8370,7 +8365,7 @@
         copyPromptButton.textContent = 'Копировать';
         copyPromptButton.title = 'Скопировать промпт со списком вопросов для ИИ';
         copyPromptButton.addEventListener('click', async () => {
-            const copied = await copyTextToClipboard(buildAiPromptText(items));
+            const copied = await copyTextToClipboard(buildAiPromptText(items, { screenshotAttached: false }));
             setTemporaryButtonText(copyPromptButton, copied ? 'Скопировано' : 'Не вышло');
         });
 

@@ -29,7 +29,7 @@
     }
     function request(session, action, payload) {
         if (window === window.top) {
-            if (action === 'map') return Promise.resolve({ rect: payload, width: window.innerWidth, height: window.innerHeight });
+            if (action === 'map') return Promise.resolve({ rect: payload, localRect: payload, width: window.innerWidth, height: window.innerHeight });
             return Promise.resolve({ width: window.innerWidth, height: window.innerHeight });
         }
         return new Promise((resolve, reject) => {
@@ -60,9 +60,11 @@
         }
         if (!state) {
             if (action !== 'prepare' || sessions.size >= 8) throw new Error('Screenshot frame session is unavailable');
-            state = { source, positions: new Map(), timer: setTimeout(() => { restore(session); request(session, 'restore').catch(() => {}); }, 120000) };
+            state = { source, positions: new Map() };
             sessions.set(session, state);
         }
+        clearTimeout(state.timer);
+        state.timer = setTimeout(() => { restore(session); request(session, 'restore').catch(() => {}); }, 120000);
         const parents = scrollers(frame);
         for (const target of [window, ...parents]) {
             if (!state.positions.has(target)) state.positions.set(target, { x: target.scrollX ?? target.scrollLeft, y: target.scrollY ?? target.scrollTop });
@@ -93,7 +95,16 @@
             mapped = clip(mapped, { left: rect.left + parent.clientLeft, top: rect.top + parent.clientTop, right: rect.left + parent.clientLeft + parent.clientWidth, bottom: rect.top + parent.clientTop + parent.clientHeight });
         }
         mapped = clip(mapped, { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight });
-        return request(session, action, mapped);
+        const result = await request(session, action, mapped);
+        // Carry the visible crop back into the requesting frame's coordinates.
+        const visible = result.localRect;
+        return { ...result, localRect: {
+            left: (visible.left - origin.x) / origin.scaleX,
+            top: (visible.top - origin.y) / origin.scaleY,
+            right: (visible.right - origin.x) / origin.scaleX,
+            bottom: (visible.bottom - origin.y) / origin.scaleY
+        } };
+
     }
     window.addEventListener('message', event => {
         const message = event.data;

@@ -13,6 +13,7 @@ function worker(storage, sent, options = {}) {
         messageHandler: async () => ({ error_type: true, error_message: 'isParcel ==> false' })
     });
     const context = {
+        indexedDB: options.indexedDB || new (require('fake-indexeddb').IDBFactory)(),
         URL, Date: { now: () => options.now ?? Date.now() }, crypto: require('node:crypto').webcrypto, setTimeout: options.schedule || setTimeout,
         chrome: {
             storage: { session: {
@@ -172,20 +173,21 @@ test('a correction prompt retries delivery when the previous tab job is still re
 });
 
 
-test('screenshots survive worker storage and are forwarded to the ChatGPT adapter', async () => {
+test('full-page PDFs survive worker storage and are forwarded to the ChatGPT adapter', async () => {
     const storage = {}, sent = [];
     const w = worker(storage, sent);
-    const images = [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
-    await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'combined answers', images }, source);
-    assert.deepEqual(storage.paramExtAiJob.images, images);
-    assert.deepEqual(sent[0][1].job.images, images);
+    const attachments = [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' }];
+    await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'combined answers', attachments }, source);
+    assert.equal(storage.paramExtAiJob.attachments, undefined);
+    assert.equal(storage.paramExtAiJob.hasAttachment, true);
+    assert.deepEqual(sent[0][1].job.attachments, attachments);
 });
 
 test('invalid screenshot payloads are rejected before a ChatGPT job is reserved', async () => {
-    for (const images of [[{ name: 'bad.png', dataUrl: 'https://example.com/a.png' }], Array(13).fill({ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' })]) {
+    for (const attachments of [[{ name: 'bad.png', dataUrl: 'https://example.com/a.png' }], Array(13).fill({ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,JVBERi0=' })]) {
         const storage = {}, sent = [];
-        const response = await worker(storage, sent).request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'test', images }, source);
-        assert.match(response.error, /screenshots/);
+        const response = await worker(storage, sent).request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'test', attachments }, source);
+        assert.match(response.error, /PDF/);
         assert.equal(storage.paramExtAiJob, undefined);
         assert.equal(sent.length, 0);
     }
@@ -245,4 +247,32 @@ test('recovery retains send progress and rejects results from the previous docum
     await flush(); assert.equal(storage.paramExtAiJob.id, response.id);
     restarted.message({ type: 'PARAMEXT_CHATGPT_RESULT', id: response.id, instanceId: 'new-document', text: '{"answers":[]}' }, sender);
     await flush(); assert.equal(storage.paramExtAiJob, undefined);
+});
+
+test('a large full-page PDF survives a worker restart outside the session-storage quota and is cleaned up', async () => {
+    const indexedDB = new (require('fake-indexeddb').IDBFactory)();
+    const storage = {}, sent = [];
+    const attachments = [{ name: 'openedu-full-page.pdf', mimeType: 'application/pdf', dataUrl: 'data:application/pdf;base64,' + 'A'.repeat(12000000) }];
+    const w = worker(storage, sent, { indexedDB });
+    const response = await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'Solve using the full PDF', attachments }, source);
+    assert.ok(response.id);
+    assert.ok(JSON.stringify(storage).length < 1000);
+    assert.equal(sent[0][1].job.attachments[0].dataUrl.length, attachments[0].dataUrl.length);
+    storage.paramExtAiJob.dispatched = false;
+    const resumed = worker(storage, sent, { indexedDB });
+    await resumed.request({ type: 'PARAMEXT_CHATGPT_READY' }, { url: 'https://chatgpt.com/', tab: { id: 20 } });
+    assert.equal(sent[1][1].job.attachments[0].dataUrl, attachments[0].dataUrl);
+    resumed.message({ type: 'PARAMEXT_CHATGPT_RESULT', id: response.id, text: '{"answers":[]}' }, { url: 'https://chatgpt.com/', tab: { id: 20 } });
+    for (let i = 0; i < 20; i++) await flush();
+    assert.equal(storage.paramExtAiJob, undefined);
+    const database = await new Promise((resolve, reject) => {
+        const request = indexedDB.open('moodushAiDocuments', 1);
+        request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    const remaining = await new Promise((resolve, reject) => {
+        const request = database.transaction('attachments').objectStore('attachments').count();
+        request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+    });
+    assert.equal(remaining, 0);
+    database.close();
 });

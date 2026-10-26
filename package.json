@@ -9,7 +9,9 @@
     "release:manifest": "node scripts/sign-release-manifest.mjs"
   },
   "devDependencies": {
-    "jsdom": "26.1.0"
+    "fake-indexeddb": "^6.2.6",
+    "jsdom": "26.1.0",
+    "pdf-lib": "1.17.1"
   },
   "engines": {
     "node": ">=20"
