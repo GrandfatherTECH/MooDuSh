@@ -8860,6 +8860,7 @@
     }
 
     function refreshActiveSequenceTabForEmptySection(source) {
+        if (window.ParamExtOpeneduReminders?.hasSavedUnsupportedTask()) return false;
         if (!isTopFrame || !settings?.openedu?.activeTabRefreshEnabled) {
             return false;
         }
@@ -9029,6 +9030,22 @@
             lastSequenceTabKey = activeTabKey;
         } else if (activeTabKey && activeTabKey !== lastSequenceTabKey) {
             markSequenceNavigation('active-tab-changed', activeTabKey);
+        }
+
+        if (window.ParamExtOpeneduReminders?.hasSavedUnsupportedTask()) {
+            // A reminder replaces the completion requirement for this task.
+            // Still wait for parsing and finish any supported questions sharing
+            // the section before moving on.
+            if (!isAutoAdvanceEnabled() || aiRun) return;
+            const expectedFrames = [...document.querySelectorAll('iframe[src]')].filter(frame => {
+                try { return /(^|\.)openedu\.ru$/i.test(new URL(frame.src, location.href).hostname); } catch (_) { return false; }
+            });
+            const framesReady = expectedFrames.every(frame => [...topFrameIframeSnapshots.values()].some(snapshot => snapshot.source === frame.contentWindow && snapshot.updatedAt >= lastSequenceNavigationAt));
+            const questions = (isChatgptAutoMode() ? aiSnapshot(aiLocalQuestions()) : parseQuestions()).concat(topFrameIframeQuestions || []);
+            const unsettled = questions.some(q => !q.correct && !(isChatgptAutoMode() && q.aiExhausted));
+            if (!framesReady || unsettled || now - lastSequenceNavigationAt < AUTO_ADVANCE_PARSE_WAIT_MS) return;
+            if (now - lastAutoAdvanceAt >= Number(settings.openedu.autoAdvanceDelayMs || 1800)) requestNextSequencePage();
+            return;
         }
 
         if (isChatgptAutoMode()) {
