@@ -86,7 +86,7 @@ function workflow(questions, replies, grade) {
     vm.runInContext(snippet, context);
     context.requestMock = async prompt => { requests.push(prompt); return replies.shift(); };
     context.submitMock = async item => { submissions.push(item.questionKey); const live = q.find(current => current.questionKey === item.questionKey || (item.domId && current.domId === item.domId)); live.used++; grade(live); };
-    const request = vm.runInContext('requestChatgpt', context);
+    const request = vm.runInContext('requestChatgptOnce', context);
     vm.runInContext('requestChatgpt = requestMock; submitAiProblem = submitMock;', context);
     return { context, q, requests, submissions, applications, request, run: () => vm.runInContext('solveWithChatgpt(aiSectionKey(aiLocalQuestions()), {})', context) };
 }
@@ -373,4 +373,35 @@ test('repeated empty answers stop after two correction requests without spending
     assert.equal(w.requests.length, 3);
     assert.equal(w.applications.length, 0);
     assert.equal(w.submissions.length, 0);
+});
+
+
+test('visual handshake captures requested questions and asks for combined answers to the original list', async () => {
+    const w = workflow([{}, {}], [], () => {});
+    const images = [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
+    const calls = [], captures = [];
+    const items = [{ question: { questionKey: 'Q1' } }, { question: { questionKey: 'Q2' } }];
+    w.context.visualItems = items;
+    w.context.captureMock = async (value, actualItems) => { captures.push([value, actualItems]); return images; };
+    w.context.onceMock = async (prompt, attachments) => {
+        calls.push({ prompt, attachments });
+        assert.equal(w.applications.length, 0);
+        return calls.length === 1 ? JSON.stringify({ type: 'visual_context_request', questionKeys: ['Q2'] }) : reply('Q1', 'Q2');
+    };
+    vm.runInContext('requestChatgptOnce = onceMock; captureAiQuestions = captureMock;', w.context);
+    // workflow() normally substitutes the high-level transport for LMS tests;
+    // evaluate the actual wrapper here to exercise the visual protocol.
+    const content = fs.readFileSync(require.resolve('../js/openedu_content.js'), 'utf8');
+    vm.runInContext(content.slice(content.indexOf('    async function requestChatgpt(prompt, items)'), content.indexOf('    function requestChatgptOnce(')), w.context);
+    assert.equal(await vm.runInContext('requestChatgpt("Original Q1 Q2", visualItems)', w.context), reply('Q1', 'Q2'));
+    assert.equal(calls.length, 2);
+    assert.equal(captures[0][1], items);
+    assert.deepEqual(Array.from(captures[0][0].questionKeys), ['Q2']);
+    assert.equal(calls[1].attachments, images);
+    assert.ok(calls[1].prompt.startsWith('Original Q1 Q2'));
+    assert.match(calls[1].prompt, /КАЖДЫЙ вопрос исходного списка/);
+    assert.match(calls[1].prompt, /question-Q2-1.png/);
+    w.context.onceMock = async () => JSON.stringify({ type: 'visual_context_request', questionKeys: ['Q2'] });
+    vm.runInContext('requestChatgptOnce = onceMock', w.context);
+    await assert.rejects(vm.runInContext('requestChatgpt("Original Q1 Q2", visualItems)', w.context), /still needs visual context/);
 });

@@ -147,7 +147,7 @@
             else if (char === '}' && --depth === 0) {
                 try {
                     const value = JSON.parse(source.slice(start, i + 1));
-                    if (value && Array.isArray(value.answers)) candidates.push(JSON.stringify(value));
+                    if (value && (value.type === 'visual_context_request' || Array.isArray(value.answers))) candidates.push(JSON.stringify(value));
                 } catch (_) { /* A label/example is not an answer payload. */ }
                 start = -1;
             }
@@ -240,6 +240,46 @@
         throw new Error('ChatGPT did not confirm sending the prompt. Check the composer; automatic sending stopped.');
     }
 
+    async function attachImages(editor, images) {
+        if (!images?.length) return;
+        status('прикрепляю снимки вопросов');
+        const transfer = new DataTransfer();
+        for (const image of images) {
+            const bytes = Uint8Array.from(atob(image.dataUrl.split(',')[1]), char => char.charCodeAt(0));
+            transfer.items.add(new File([bytes], image.name, { type: 'image/png' }));
+        }
+        const scope = editor.closest('form') || document;
+        const attachments = () => [...scope.querySelectorAll('img, [data-testid="attachment"], [data-testid="file-thumbnail"], button[aria-label*="Remove file"], button[aria-label*="Remove attachment"], button[aria-label*="Удалить файл"]')];
+        const previous = new Set(attachments());
+        const input = [...document.querySelectorAll('input[type="file"]')].find(node =>
+            !node.disabled && (node.multiple || images.length === 1)
+            && (!node.accept || /image|\.png|\*/i.test(node.accept)));
+        if (input) {
+            input.files = transfer.files;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        } else {
+            editor.focus();
+            editor.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+        }
+        const deadline = Date.now() + 60000;
+        let readySince = 0;
+        while (Date.now() < deadline) {
+            const added = attachments().filter(node => !previous.has(node));
+            // A single attachment can expose both a thumbnail and a remove
+            // button. Do not count those as two uploaded screenshots.
+            const count = Math.max(new Set(added.filter(node => node.tagName === 'IMG').map(node => node.src)).size,
+                added.filter(node => node.tagName === 'BUTTON').length,
+                added.filter(node => node.hasAttribute('data-testid')).length);
+            const pending = scope.querySelector('[role="progressbar"], [data-testid*="upload-progress"], [aria-busy="true"]');
+            if (count >= images.length && !pending && findSend(editor)) {
+                if (!readySince) readySince = Date.now();
+                if (Date.now() - readySince >= 1500) return;
+            } else readySince = 0;
+            await pause(500);
+        }
+        throw new Error('Could not confirm screenshot attachments in ChatGPT. No answer request was sent.');
+    }
+
     async function run(job) {
         const editorDeadline = Date.now() + 30000;
         let editor;
@@ -257,6 +297,7 @@
         const prompt = job.prompt + '\nRequest ID: ' + job.id;
         status(hasDraft ? 'возобновляю оставшийся запрос MooDuSh' : 'вставляю запрос');
         insertPrompt(editor, prompt);
+        await attachImages(editor, job.images);
         const before = await sendPrompt(editor, prompt, job.id);
         status('запрос отправлен, ожидаю ответ');
         const deadline = Date.now() + Math.min(3600000, Math.max(60000, Number(job.answerTimeoutMs) || 600000));
@@ -287,7 +328,7 @@
                 // answer to mount until the response deadline.
             }
         }
-        throw new Error('Timed out waiting for a valid {"answers":[...]} response from the current ChatGPT turn. No answers were applied.');
+        throw new Error('Timed out waiting for a valid answers or visual_context_request JSON response from the current ChatGPT turn. No answers were applied.');
     }
 
     function accept(job) {

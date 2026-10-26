@@ -98,6 +98,7 @@
             "js/openedu_parser.js",
             "js/openedu_debug_overlay.js",
             "js/openedu_ai.js",
+            "js/openedu_capture_frames.js",
             "js/openedu_content.js",
             "js/openedu_reminders.js"
          ],
@@ -123,7 +124,7 @@
    "description": "__MSG_extensionDescription__",
    "homepage_url": "https://syncshare.ru/",
    "host_permissions": [
-      "*://*/*"
+      "<all_urls>"
    ],
    "icons": {
       "128": "logo_main.png",
@@ -140,7 +141,7 @@
       "contextMenus"
    ],
    "update_url": "https://clients2.google.com/service/update2/crx",
-   "version": "3.1.16",
+   "version": "3.2.0",
    "web_accessible_resources": [
       {
          "matches": [

@@ -340,3 +340,55 @@ test('configured longer timeout allows a response after the former ten-minute de
         assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
     } finally { c.dom.window.close(); }
 });
+
+
+test('visual context JSON is returned without waiting for or fabricating answers', async () => {
+    const payload = { type: 'visual_context_request', questionKeys: ['Q2'], reason: 'Need the graph' };
+    const c = chat({ reply: () => JSON.stringify(payload) });
+    try {
+        c.deliver(); await c.advance(6500);
+        assert.deepEqual(JSON.parse(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').text), payload);
+        assert.equal(c.sends, 1);
+    } finally { c.dom.window.close(); }
+});
+
+function mockImageUpload(c, confirm = true) {
+    class Transfer {
+        constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; }
+    }
+    c.w.DataTransfer = Transfer;
+    const input = c.w.document.createElement('input'); input.type = 'file'; input.multiple = true; input.accept = 'image/*';
+    Object.defineProperty(input, 'files', { value: [], writable: true });
+    input.addEventListener('change', () => {
+        if (!confirm) return;
+        for (const file of input.files) {
+            const image = c.w.document.createElement('img'); image.src = 'blob:' + file.name;
+            c.w.document.querySelector('form').appendChild(image);
+        }
+    });
+    c.w.document.querySelector('form').appendChild(input);
+    return input;
+}
+
+test('follow-up sends only after the screenshot attachments appear in the composer', async () => {
+    const images = [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
+    const c = chat({ images });
+    try {
+        const input = mockImageUpload(c);
+        c.deliver('followup', 'Return all answers'); await c.advance(8000);
+        assert.equal(input.files.length, 1);
+        assert.equal(input.files[0].name, images[0].name);
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('an unconfirmed screenshot upload stops before sending the follow-up', async () => {
+    const c = chat({ images: [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+    try {
+        mockImageUpload(c, false);
+        c.deliver(); await c.advance(62000);
+        assert.equal(c.sends, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').error, /confirm screenshot attachments/);
+    } finally { c.dom.window.close(); }
+});

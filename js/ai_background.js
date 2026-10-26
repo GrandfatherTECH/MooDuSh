@@ -25,7 +25,7 @@
             if (!current || current.id !== job.id || current.dispatched) return;
             const tab = await chrome.tabs.get(job.aiTab);
             if (!isChatgpt(tab.url) || tab.status !== 'complete') return;
-            const acknowledgement = await chrome.tabs.sendMessage(job.aiTab, { type: 'PARAMEXT_CHATGPT_RUN', job: { id: job.id, prompt: job.prompt, answerTimeoutMs: answerTimeout(job.answerTimeoutMs) } });
+            const acknowledgement = await chrome.tabs.sendMessage(job.aiTab, { type: 'PARAMEXT_CHATGPT_RUN', job: { id: job.id, prompt: job.prompt, images: job.images, answerTimeoutMs: answerTimeout(job.answerTimeoutMs) } });
             if (acknowledgement?.busy) {
                 // The previous result can reach OpenEdu before the tab adapter
                 // clears activeJob. Retry the queued request once it releases.
@@ -50,6 +50,19 @@
         } finally { dispatching = false; }
     }
     chrome.runtime.onMessage.addListener((message, sender, respond) => {
+        if (message?.type === 'PARAMEXT_AI_CAPTURE' && isOpenedu(sender.url) && sender.tab) {
+            (async () => {
+                const tab = await chrome.tabs.get(sender.tab.id);
+                await chrome.tabs.update(tab.id, { active: true });
+                await chrome.windows.update(tab.windowId, { focused: true });
+                // Let scrolling, focus and lazy-loaded images settle before capture.
+                await new Promise(resolve => setTimeout(resolve, 600));
+                const [active] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+                if (active?.id !== tab.id) throw new Error('Course tab lost focus during screenshot capture');
+                return { dataUrl: await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' }) };
+            })().then(respond).catch(error => respond({ error: error.message }));
+            return true;
+        }
         if (message?.type === 'PARAMEXT_AI_REQUEST' && isOpenedu(sender.url) && sender.tab) {
             (async () => {
                 if (reserving) return { error: 'Another AI request is starting; try again shortly', busy: true };
@@ -58,6 +71,13 @@
                     const stored = await chrome.storage.session.get([KEY, TAB]);
                     if (stored[KEY] && Date.now() - stored[KEY].createdAt < jobTimeout(stored[KEY])) return { error: 'Another AI request is running', busy: true };
                     if (typeof message.prompt !== 'string' || message.prompt.length > 100000) throw new Error('Invalid AI prompt');
+                    const images = message.images || [];
+                    if (!Array.isArray(images) || images.length > 12 || images.some(image =>
+                        !image || typeof image.name !== 'string' || !/^question-[A-Za-z0-9_-]+-\d+\.png$/.test(image.name)
+                        || typeof image.dataUrl !== 'string' || !/^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image.dataUrl))
+                        || images.reduce((size, image) => size + image.dataUrl.length, 0) > 6000000) {
+                        throw new Error('Invalid or oversized AI screenshots (maximum 12 images / 6 MB)');
+                    }
                     let tab;
                     if (stored[TAB]) {
                         try { tab = await chrome.tabs.get(stored[TAB]); } catch (_) {}
@@ -65,7 +85,7 @@
                     }
                     if (!tab) tab = await chrome.tabs.create({ url: 'https://chatgpt.com/', active: true });
                     else await chrome.tabs.update(tab.id, { active: true });
-                    const job = { id: crypto.randomUUID(), sourceTab: sender.tab.id, sourceFrame: sender.frameId, aiTab: tab.id, createdAt: Date.now(), prompt: message.prompt, answerTimeoutMs: answerTimeout(message.answerTimeoutMs) };
+                    const job = { id: crypto.randomUUID(), sourceTab: sender.tab.id, sourceFrame: sender.frameId, aiTab: tab.id, createdAt: Date.now(), prompt: message.prompt, images, answerTimeoutMs: answerTimeout(message.answerTimeoutMs) };
                     await chrome.storage.session.set({ [KEY]: job, [TAB]: tab.id });
                     // Query current readiness after saving: create() can return a stale
                     // loading status after onUpdated/READY have already fired.

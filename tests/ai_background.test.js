@@ -21,9 +21,12 @@ function worker(storage, sent, options = {}) {
                 async remove(key) { delete storage[key]; }
             } },
             runtime: { onMessage: { addListener(fn) { listener = fn; } } },
+            windows: { async update() {} },
             tabs: {
                 async create() { return { id: 20, url: 'https://chatgpt.com/', status: options.createStatus || 'complete' }; },
-                async get(id) { return { id, url: 'https://chatgpt.com/c/test', status: 'complete' }; },
+                async get(id) { return { id, windowId: 1, url: 'https://chatgpt.com/c/test', status: 'complete' }; },
+                async query() { return [{ id: options.activeTab ?? 3 }]; },
+                async captureVisibleTab(...args) { options.captures?.push(args); return 'data:image/png;base64,YQ=='; },
                 async update(...args) { options.updates?.push(args); },
                 async sendMessage(...args) { sent.push(args); if (options.busyCount > 0) { options.busyCount--; return { busy: true }; } return options.noAcknowledgement ? undefined : { ok: true, id: args[1].job?.id }; },
                 onUpdated: { addListener(fn) { updated = fn; } },
@@ -147,4 +150,46 @@ test('a correction prompt retries delivery when the previous tab job is still re
     assert.equal(storage.paramExtAiJob.dispatched, true);
     assert.equal(sent.length, 2);
     assert.equal(sent[1][1].job.id, response.id);
+});
+
+
+test('screenshots survive worker storage and are forwarded to the ChatGPT adapter', async () => {
+    const storage = {}, sent = [];
+    const w = worker(storage, sent);
+    const images = [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
+    await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'combined answers', images }, source);
+    assert.deepEqual(storage.paramExtAiJob.images, images);
+    assert.deepEqual(sent[0][1].job.images, images);
+});
+
+test('invalid screenshot payloads are rejected before a ChatGPT job is reserved', async () => {
+    for (const images of [[{ name: 'bad.png', dataUrl: 'https://example.com/a.png' }], Array(13).fill({ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' })]) {
+        const storage = {}, sent = [];
+        const response = await worker(storage, sent).request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'test', images }, source);
+        assert.match(response.error, /screenshots/);
+        assert.equal(storage.paramExtAiJob, undefined);
+        assert.equal(sent.length, 0);
+    }
+});
+
+test('capture is tied to the requesting course tab and fails if focus changes', async () => {
+    const captures = [];
+    const options = { captures, schedule: callback => callback() };
+    const w = worker({}, [], options);
+    assert.equal((await w.request({ type: 'PARAMEXT_AI_CAPTURE' }, source)).dataUrl, 'data:image/png;base64,YQ==');
+    assert.equal(captures.length, 1);
+    assert.equal(captures[0][0], 1);
+    options.activeTab = 99;
+    assert.match((await w.request({ type: 'PARAMEXT_AI_CAPTURE' }, source)).error, /lost focus/);
+    assert.equal(captures.length, 1);
+});
+
+
+test('manifest grants the explicit all-URLs permission required for automatic screenshots', () => {
+    const manifest = JSON.parse(fs.readFileSync(require.resolve('../manifest.json'), 'utf8'));
+    // *://*/* allows normal page access but does not satisfy captureVisibleTab.
+    // activeTab alone requires a user invocation, so it cannot support this
+    // automated capture after switching back from ChatGPT.
+    assert.ok(manifest.host_permissions.includes('<all_urls>'),
+        'Automatic screenshots require <all_urls> in host_permissions');
 });

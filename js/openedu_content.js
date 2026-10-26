@@ -2598,7 +2598,7 @@
             return true;
         }
 
-        return /^(?:выберите|отметьте)\s+(?:один\s+|все\s+|несколько\s+)?(?:правильн\w+|верн\w+)\s+вариант(?:ы)?(?:\s+ответ(?:а|ов)?)?$/i.test(text)
+        return /^(?:выберите|отметьте)\s+(?:один\s+|все\s+|несколько\s+)?(?:правильн[а-яё]+|верн[а-яё]+)\s+вариант(?:ы)?(?:\s+ответ(?:а|ов)?)?$/i.test(text)
             || /^выберите\s+(?:правильный|верный)\s+ответ$/i.test(text)
             || /^выберите\s+ответ$/i.test(text)
             || /^дополните(?:\s+(?:предложение|фразу|текст|утверждение))?$/i.test(text)
@@ -3493,6 +3493,9 @@
             if (!answerText) {
                 return;
             }
+            // Standalone instruction labels are not answer choices. The same
+            // problem can be visited through both its select and hidden LMS input.
+            if (!input && isGenericQuestionInstructionText(answerText)) return;
             const answerAliases = getOptionAnswerAliases(label, input, mediaDescriptors, answerText);
 
             const dedupeKey = groupKey + '|' + (inputId || answerText);
@@ -4126,6 +4129,7 @@
                 const contextualNearPrompt = nearPrompt ? mergePromptWithAdjacentContext(root, nearPrompt) : '';
                 const prompt = sanitizeQuestionPromptText(
                     (getMatchingTableData(groupRoot) ? getMatchingTablePrompt(groupRoot) : '')
+                        || getInlineInputPrompt(groupRoot, groupOptions)
                         || getMultiInputPrompt(groupRoot)
                         || contextualNearPrompt
                         || getQuestionPrompt(groupRoot)
@@ -6949,7 +6953,102 @@
         else syncIframeStateToTop(lastMergedStatsByQuestion || {}, questions, topFrameOnlineState);
     }
 
-    function requestChatgpt(prompt) {
+    async function captureAiQuestions(request, items) {
+        if (Object.hasOwn(request, 'answers') || !Array.isArray(request.questionKeys) || !request.questionKeys.length
+            || request.questionKeys.some(key => typeof key !== 'string')) {
+            throw new Error('Invalid visual context request: expected questionKeys without answers');
+        }
+        const selected = [...new Set(request.questionKeys)].map(key => {
+            const item = items.find(item => item.question.questionKey === key);
+            if (!item) throw new Error('Unknown question in visual context request: ' + key);
+            return item;
+        });
+        const images = [];
+        const frameSession = crypto.randomUUID();
+        const frames = window.ParamExtOpeneduCaptureFrames;
+        if (!frames) throw new Error('Screenshot frame adapter is unavailable. Reload the extension and course tabs.');
+        const scrollPositions = new Map();
+        const remember = target => { if (!scrollPositions.has(target)) scrollPositions.set(target, { x: target.scrollX ?? target.scrollLeft, y: target.scrollY ?? target.scrollTop }); };
+        try {
+            for (const item of selected) {
+                const block = getQuestionProblemContainer(item.question);
+                if (!block?.isConnected || block.ownerDocument !== document) throw new Error('Requested question is not visible in the current course frame');
+                remember(window);
+                const viewport = await frames.request(frameSession, 'prepare');
+                block.scrollIntoView({ block: 'start', inline: 'start', behavior: 'instant' });
+                await aiPause(600);
+                const size = block.getBoundingClientRect();
+                let viewportWidth = Math.min(window.innerWidth, viewport.width), viewportHeight = Math.min(window.innerHeight, viewport.height);
+                const scrollers = [];
+                for (let parent = block.parentElement; parent && parent !== document.scrollingElement; parent = parent.parentElement) {
+                    const style = getComputedStyle(parent);
+                    if (/(auto|scroll|hidden)/.test(style.overflow + style.overflowX + style.overflowY)
+                        && (parent.scrollHeight > parent.clientHeight || parent.scrollWidth > parent.clientWidth)) {
+                        scrollers.push(parent); remember(parent);
+                        viewportWidth = Math.min(viewportWidth, parent.clientWidth);
+                        viewportHeight = Math.min(viewportHeight, parent.clientHeight);
+                    }
+                }
+                const stepX = Math.max(1, viewportWidth - 80), stepY = Math.max(1, viewportHeight - 100);
+                let part = 0;
+                for (let y = 0; y < size.height; y += stepY) {
+                    for (let x = 0; x < size.width; x += stepX) {
+                        if (images.length >= 12) throw new Error('Requested questions need more than 12 screenshots');
+                        for (const parent of scrollers) {
+                            const rect = block.getBoundingClientRect(), parentRect = parent.getBoundingClientRect();
+                            parent.scrollBy({ left: rect.left + x - parentRect.left - 20, top: rect.top + y - parentRect.top - 30, behavior: 'instant' });
+                        }
+                        const rect = block.getBoundingClientRect();
+                        window.scrollBy({ left: rect.left + x - 20, top: rect.top + y - 30, behavior: 'instant' });
+                        await frames.request(frameSession, 'scroll', { x: block.getBoundingClientRect().left + x, y: block.getBoundingClientRect().top + y });
+                        await aiPause(300);
+                        const current = block.getBoundingClientRect();
+                        let left = Math.max(0, current.left), top = Math.max(0, current.top);
+                        let right = Math.min(window.innerWidth, current.right), bottom = Math.min(window.innerHeight, current.bottom);
+                        for (const parent of scrollers) {
+                            const clip = parent.getBoundingClientRect();
+                            left = Math.max(left, clip.left + parent.clientLeft); top = Math.max(top, clip.top + parent.clientTop);
+                            right = Math.min(right, clip.left + parent.clientLeft + parent.clientWidth); bottom = Math.min(bottom, clip.top + parent.clientTop + parent.clientHeight);
+                        }
+                        const mapped = await frames.request(frameSession, 'map', { left, top, right, bottom });
+                        ({ left, top, right, bottom } = mapped.rect);
+                        if (right <= left || bottom <= top) throw new Error('Requested question is outside the visible viewport');
+                        const capture = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_CAPTURE' });
+                        if (!capture?.dataUrl) throw new Error(capture?.error || 'Screenshot capture failed');
+                        const bitmap = new Image();
+                        await new Promise((resolve, reject) => { bitmap.onload = resolve; bitmap.onerror = () => reject(new Error('Invalid screenshot')); bitmap.src = capture.dataUrl; });
+                        const scaleX = bitmap.naturalWidth / mapped.width, scaleY = bitmap.naturalHeight / mapped.height;
+                        const canvas = document.createElement('canvas');
+                        canvas.width = Math.round((right - left) * scaleX); canvas.height = Math.round((bottom - top) * scaleY);
+                        canvas.getContext('2d').drawImage(bitmap, left * scaleX, top * scaleY, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+                        images.push({ name: 'question-' + item.question.questionKey.replace(/[^A-Za-z0-9_-]/g, '_') + '-' + (++part) + '.png', dataUrl: canvas.toDataURL('image/png') });
+                        if (images.reduce((size, image) => size + image.dataUrl.length, 0) > 6000000) throw new Error('Question screenshots exceed the 6 MB limit');
+                    }
+                }
+            }
+        } finally {
+            await frames.request(frameSession, 'restore').catch(error => debugSync('ai_screenshot_restore_failed', { error: error.message }));
+            for (const [win, position] of scrollPositions) win.scrollTo({ left: position.x, top: position.y, behavior: 'instant' });
+        }
+        if (!images.length) throw new Error('No question screenshots were captured');
+        return images;
+    }
+
+    async function requestChatgpt(prompt, items) {
+        const response = await requestChatgptOnce(prompt);
+        const value = JSON.parse(response);
+        if (value?.type !== 'visual_context_request') return response;
+        reportAiWorkflowStatus('снимки запрошенных вопросов', false);
+        const images = await captureAiQuestions(value, items);
+        const followup = prompt + '\nВложения содержат запрошенные снимки вопросов. Имена файлов связывают снимки с questionKey; несколько частей одного вопроса нужно рассматривать вместе.\n'
+            + 'Используй снимки и весь исходный список выше. Теперь верни один полный объединённый JSON {"answers":[...]} с ответами на КАЖДЫЙ вопрос исходного списка, включая вопросы без снимков. Не возвращай частичные ответы или новый visual_context_request.\n'
+            + 'Приложенные файлы: ' + images.map(image => image.name).join(', ');
+        const combined = await requestChatgptOnce(followup, images);
+        if (JSON.parse(combined)?.type === 'visual_context_request') throw new Error('ChatGPT still needs visual context after screenshots; no answers were applied');
+        return combined;
+    }
+
+    function requestChatgptOnce(prompt, images = []) {
         return new Promise(async (resolve, reject) => {
             try {
                 // Freeze this request's setting; later edits apply to the next request.
@@ -6958,7 +7057,7 @@
                 let response;
                 const deadline = Date.now() + requestTimeoutMs;
                 do {
-                    response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_REQUEST', prompt, answerTimeoutMs });
+                    response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_REQUEST', prompt, images, answerTimeoutMs });
                     if (!response?.busy) break;
                     await aiPause(2000);
                 } while (Date.now() < deadline && isChatgptAutoMode());
@@ -7063,7 +7162,7 @@
                 let extra = round ? '\nПредыдущие попытки (только вопросы с оставшимися попытками): ' + JSON.stringify(wireFeedback)
                     + '\nВопросы wrong — неверно. Исправь их; не повторяй прежние неверные ответы.' : '';
                 for (let repair = 0; repair < 3; repair++) {
-                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra);
+                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra, requestItems);
                     assertCurrent();
                     try {
                         const entries = window.ParamExtOpeneduAi.parseResponse(response,
@@ -7667,6 +7766,18 @@
         return completedCount > 0 ? ('популярный · ' + completedCount) : 'популярный';
     }
 
+    function getInlineInputPrompt(block, options) {
+        const type = options[0]?.inputType;
+        if (!['text', 'select'].includes(type) || options.some(option => option.inputType !== type)) return '';
+        const selector = type === 'select' ? 'select' : 'input[type="text"], textarea';
+        const scopeSelector = type === 'select' ? '.inline-optionresponse-text-wrap, .inline-optionresponse' : '.inline-input-task';
+        const target = [...block.querySelectorAll(selector)].find(control => options.some(option =>
+            (option.inputId && control.id === option.inputId)
+            || (option.inputName && control.name === option.inputName)));
+        const scope = target?.closest(scopeSelector) || block.closest(scopeSelector);
+        return scope ? (readInputContext(scope, options, selector)?.text || '') : '';
+    }
+
     function getAiTextInputPrompt(question) {
         const options = (question.options || []).filter(option => option.inputType === 'text');
         if (!options.length) return '';
@@ -7676,14 +7787,20 @@
         // span sibling text nodes, paragraphs, and other blanks in this problem.
         const scope = block.closest('.problem')
             || block.closest('.problems-wrapper[data-url], .xblock-student_view-problem') || block;
-        const controls = [...scope.querySelectorAll('input[type="text"], textarea')];
+        const context = readInputContext(scope, options);
+        if (!context) return '';
+        return 'Заполни только ' + context.markers.join(', ') + '. Остальные [BLANK N] относятся к другим полям. ' + context.text;
+    }
+
+    function readInputContext(scope, options, selector = 'input[type="text"], textarea') {
+        const controls = [...scope.querySelectorAll(selector)];
         const targets = controls.filter(control => options.some(option =>
             (option.inputId && control.id === option.inputId)
             || (option.inputName && control.name === option.inputName)));
-        if (!targets.length) return '';
+        if (!targets.length) return null;
         const clone = scope.cloneNode(true);
         const markers = [];
-        [...clone.querySelectorAll('input[type="text"], textarea')].forEach((control, index) => {
+        [...clone.querySelectorAll(selector)].forEach((control, index) => {
             const marker = (targets.includes(controls[index]) ? 'ANSWER ' : 'BLANK ') + (index + 1);
             if (targets.includes(controls[index])) markers.push('[' + marker + ']');
             control.replaceWith(clone.ownerDocument.createTextNode(' [' + marker + '] '));
@@ -7691,7 +7808,7 @@
         clone.querySelectorAll([
             PARAMEXT_WIDGET_SELECTOR, 'script', 'style', 'noscript', 'template', 'button', 'input', 'select',
             '[hidden]', '[aria-hidden="true"]', '.status', '.status-icon', '.indicator-container',
-            '[id^="answer_"]', '.feedback', '.message', '.notification', '.solution', '.hint',
+            '[id^="answer_"]', '.feedback', '.message', '.notification', '.solution', '.solution-span', '.trailing_text', '.hint',
             '.problem-progress', '.problem-results', '.submission-feedback', '.action', '.actions',
             '.sr', '.sr-only', '.MathJax_Preview', '.MJX_Assistive_MathML', 'mjx-assistive-mml'
         ].join(',')).forEach(node => node.remove());
@@ -7706,8 +7823,8 @@
         };
         const text = collapseWhitespace([read(clone), ...collectPromptMediaTokens(clone)].join(' '))
             .replace(/\s+([,.;:!?])/g, '$1');
-        if (!text || !markers.every(marker => text.includes(marker))) return '';
-        return 'Заполни только ' + markers.join(', ') + '. Остальные [BLANK N] относятся к другим полям. ' + text;
+        if (!text || !markers.every(marker => text.includes(marker))) return null;
+        return { text, markers };
     }
 
     function buildQuestionAiExport(items) {
@@ -7740,7 +7857,11 @@
         return [
             'Ниже список вопросов OpenEdu. Нужно определить правильные ответы.',
             'Используй options как список доступных вариантов. knownAnswers.verified уже подтверждены платформой, knownAnswers.popular могут быть подсказкой, knownAnswers.incorrect выбирать нельзя.',
-            'Верни только валидный JSON без markdown. Формат строго такой:',
+            'Сначала проверь, достаточно ли визуальной информации для ВСЕХ вопросов. Ссылки, имена файлов и alt-текст не заменяют изображения, графики, схемы или формулы.',
+            'Если для хотя бы одного вопроса недостаточно визуальной информации, НЕ отвечай ни на один вопрос на этом этапе. Верни ТОЛЬКО отдельный JSON следующего вида:',
+            '{"type":"visual_context_request","questionKeys":["точный questionKey нужного вопроса"],"reason":"какая визуальная информация нужна"}',
+            'Перечисли все вопросы, которым нужны снимки, в questionKeys. Не добавляй answers и не угадывай ответы. Расширение пришлёт снимки, после чего потребуется единый полный JSON ответов на весь исходный список.',
+            'Если информации достаточно, верни только валидный JSON без markdown. Формат ответов строго такой:',
             '{"answers":[{"index":1,"questionKey":"...","answers":[{"answerKey":"...","answerText":"точный текст ответа"}]}]}',
             'Копируй questionKey и index точно из каждого вопроса текущего списка. Не используй ID из предыдущих сообщений.',
             'Ответь на каждый вопрос текущего списка. Массив answers каждого вопроса должен содержать хотя бы один ответ. Пустые answers недопустимы.',
