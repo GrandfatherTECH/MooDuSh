@@ -12,6 +12,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         window.ParamExtTelemetry.installGlobalHandlers('popup');
     }
 
+    $('openRemindersBtn').addEventListener('click', async () => {
+        await chrome.runtime.sendMessage({ type: 'MOODUSH_OPEN_REMINDERS' });
+        window.close();
+    });
+
     const refs = {
         mainLogo: $('mainLogo'),
         headerStatus: $('headerStatus'),

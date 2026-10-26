@@ -98,7 +98,8 @@
             "js/openedu_parser.js",
             "js/openedu_debug_overlay.js",
             "js/openedu_ai.js",
-            "js/openedu_content.js"
+            "js/openedu_content.js",
+            "js/openedu_reminders.js"
          ],
          "matches": [
             "*://*/*"

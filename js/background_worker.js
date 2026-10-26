@@ -86,7 +86,7 @@ function openPrivacyPolicyTabGuarded(url, callback) {
 }
 
 installPrivacyPolicyTabsGuard();
-importScripts('background.js', 'ai_background.js');
+importScripts('background.js', 'ai_background.js', 'reminders_background.js');
 
 const PARAMEXT_SETTINGS_KEY = 'paramExtPlatformSettingsV2';
 const PARAMEXT_LEGACY_SETTINGS_KEY = 'paramExtSettings';
