@@ -112,7 +112,13 @@
                             <option value="stop">Остановиться</option>
                             <option value="alert">Показать вопрос</option>
                             <option value="advance">Перейти дальше</option>
+                            <option value="chatgpt">Спросить ChatGPT (авто-прохождение)</option>
                         </select>
+                    </label>
+                    <label class="field">
+                        <span>Тайм-аут ответа ChatGPT, мин</span>
+                        <input type="number" min="1" max="60" step="1" id="openeduChatgptAnswerTimeoutMinutes">
+                        <small>От 1 до 60 минут после отправки запроса. Для следующих запросов.</small>
                     </label>
                 </div>
                 <div id="openeduAutoOptions" class="option-block hidden">

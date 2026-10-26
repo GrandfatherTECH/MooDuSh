@@ -66,6 +66,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         openeduAutoUseFallbackAnswers: $('openeduAutoUseFallbackAnswers'),
         openeduAutoCheckAnswers: $('openeduAutoCheckAnswers'),
         openeduMissingAnswerAction: $('openeduMissingAnswerAction'),
+        openeduChatgptAnswerTimeoutMinutes: $('openeduChatgptAnswerTimeoutMinutes'),
         openeduAutoAdvanceDelayMs: $('openeduAutoAdvanceDelayMs'),
         openeduDebugOverlay: $('openeduDebugOverlay'),
         statsRefreshBtn: $('statsRefreshBtn'),
@@ -240,6 +241,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         refs.openeduAutoUseFallbackAnswers.checked = settings.openedu.autoUseFallbackAnswers;
         refs.openeduAutoCheckAnswers.checked = settings.openedu.autoCheckAnswers;
         refs.openeduMissingAnswerAction.value = settings.openedu.missingAnswerAction;
+        refs.openeduChatgptAnswerTimeoutMinutes.value = String(settings.openedu.chatgptAnswerTimeoutMinutes);
         refs.openeduAutoAdvanceDelayMs.value = String(settings.openedu.autoAdvanceDelayMs);
         refs.openeduDebugOverlay.checked = Boolean(settings.diagnostics?.openeduDebugOverlay);
         const moodleOnly = isMoodleOnlyMode();
@@ -295,6 +297,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         next.openedu.autoUseFallbackAnswers = refs.openeduAutoUseFallbackAnswers.checked;
         next.openedu.autoCheckAnswers = refs.openeduAutoCheckAnswers.checked;
         next.openedu.missingAnswerAction = refs.openeduMissingAnswerAction.value;
+        next.openedu.chatgptAnswerTimeoutMinutes = Number(refs.openeduChatgptAnswerTimeoutMinutes.value || 10);
         next.openedu.autoAdvanceDelayMs = Math.max(500, Number(refs.openeduAutoAdvanceDelayMs.value || next.openedu.autoAdvanceDelayMs));
         next.diagnostics.openeduDebugOverlay = refs.openeduDebugOverlay.checked;
 
@@ -645,6 +648,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         refs.openeduAutoUseFallbackAnswers,
         refs.openeduAutoCheckAnswers,
         refs.openeduMissingAnswerAction,
+        refs.openeduChatgptAnswerTimeoutMinutes,
         refs.openeduDebugOverlay
     ].forEach((control) => {
         control.addEventListener(control.tagName === 'INPUT' && control.type !== 'checkbox' ? 'input' : 'change', () => {

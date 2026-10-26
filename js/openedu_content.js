@@ -477,6 +477,8 @@
                     frameCount: topFrameIframeSnapshots.size
                 });
                 renderStick(topFrameIframeStats, topFrameIframeQuestions);
+            } else if (event.data.type === 'PARAMEXT_OPENEDU_AI_STATUS') {
+                reportAiWorkflowStatus(String(event.data.text || ''), Boolean(event.data.error));
             } else if (event.data.type === 'PARAMEXT_OPENEDU_STICK_ONLINE') {
                 topFrameOnlineState = { online: Boolean(event.data.online), text: String(event.data.text || '') };
                 window.__PARAMEXT_TOPFRAME_ONLINE_STATE = topFrameOnlineState;
@@ -4527,6 +4529,8 @@
         const sourceKey = getTopFrameIframeSourceKey(event);
         topFrameIframeSnapshots.set(sourceKey, {
             updatedAt: now,
+            pageKind: event?.data?.pageKind || 'unknown',
+            source: event.source,
             stats: event?.data?.stats && typeof event.data.stats === 'object' ? event.data.stats : {},
             questions: Array.isArray(event?.data?.questions) ? event.data.questions : []
         });
@@ -4719,9 +4723,10 @@
             return;
         }
 
-        input.checked = checked;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+        // CAPA binds checkbox readiness to click, not input/change. Native
+        // activation changes the property and emits the expected events once.
+        // It also respects disabled controls instead of editing a closed problem.
+        input.click();
     }
 
     function dispatchAnswerMutationEvents(element) {
@@ -4738,6 +4743,17 @@
         });
     }
 
+    function refreshCapaAnswerState(block) {
+        const wrapper = block?.closest('.problems-wrapper[data-url]');
+        if (!wrapper) return;
+        let marker = wrapper.getAttribute('data-moodush-capa-id');
+        if (!marker) {
+            marker = crypto.randomUUID();
+            wrapper.setAttribute('data-moodush-capa-id', marker);
+        }
+        window.postMessage({ type: 'PARAMEXT_CAPA_REFRESH', id: crypto.randomUUID(), marker }, location.origin);
+    }
+
     function notifyQuestionAnswerChanged(block, primaryControl) {
         if (!(block instanceof HTMLElement)) {
             return;
@@ -4747,6 +4763,7 @@
         const form = block.closest('form');
         dispatchAnswerMutationEvents(form);
         dispatchAnswerMutationEvents(block);
+        refreshCapaAnswerState(block);
 
         setTimeout(() => {
             dispatchAnswerMutationEvents(primaryControl);
@@ -5767,7 +5784,7 @@
 
     function getMissingAnswerAction() {
         const action = settings?.openedu?.missingAnswerAction;
-        return action === 'alert' || action === 'advance' ? action : 'stop';
+        return ['alert', 'advance', 'chatgpt'].includes(action) ? action : 'stop';
     }
 
     function getQuestionProblemContainer(question) {
@@ -5776,7 +5793,8 @@
             return null;
         }
 
-        const problem = block.closest('[data-problem-id], .problem, .xblock-student_view-problem, .problems-wrapper');
+        const problem = block.closest('.problems-wrapper[data-url]')
+            || block.closest('[data-problem-id], .problem, .xblock-student_view-problem, .problems-wrapper');
         return problem instanceof HTMLElement ? problem : block;
     }
 
@@ -5952,6 +5970,8 @@
 
         const now = Date.now();
         lastSequenceNavigationAt = now;
+        aiStoppedSection = '';
+        document.getElementById('moodush-ai-error')?.remove();
         lastSequenceNavigationGeneration += 1;
         clearTopFrameIframeSnapshots(source);
         if (activeTabKey) {
@@ -6813,7 +6833,368 @@
         }
     }
 
+    let aiRun = null;
+    let aiStoppedSection = '';
+    let aiGeneration = 0;
+    const aiGradesByControl = new Map();
+    let aiGradeSection = '';
+    const aiWaiters = new Map();
+    const aiEarlyResults = new Map();
+    const aiPause = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+
+    function isChatgptAutoMode() {
+        return isOpeneduAutoSolveMode() && settings?.openedu?.missingAnswerAction === 'chatgpt';
+    }
+
+    function aiLocalQuestions() {
+        return parseQuestions().filter(q => q.ownerDocument === document && !q.fromVirtualContent);
+    }
+
+    function aiSectionKey(questions) {
+        // Question fingerprints can change when CAPA redraws choices, matching
+        // tables or grading feedback. Navigation is identified by LMS problem
+        // containers, whose usage keys remain stable throughout those updates.
+        const wrappers = typeof document.querySelectorAll === 'function'
+            ? [...document.querySelectorAll('.problems-wrapper[data-url]')] : [];
+        const problemIds = wrappers.map(wrapper => wrapper.getAttribute('data-problem-id')
+            || wrapper.id || wrapper.getAttribute('data-url')).filter(Boolean);
+        const identities = problemIds.length ? problemIds : questions.map(question => {
+            const container = locateQuestionBlock(question)?.closest('.problems-wrapper[data-url], [data-problem-id]');
+            return container?.getAttribute('data-problem-id') || question.domId || question.questionKey;
+        });
+        return location.href + '|' + [...new Set(identities)].sort().join('|');
+    }
+
+    function aiQuestionControlKey(question) {
+        if (question.aiControlKey) return question.aiControlKey;
+        const names = [...new Set((question.options || []).map(option => option.inputName).filter(Boolean))].sort();
+        const wrapper = locateQuestionBlock(question)?.closest('.problems-wrapper[data-url]');
+        const problemId = wrapper?.getAttribute('data-problem-id') || wrapper?.id || '';
+        return names.length ? problemId + '|' + names.join('|') : question.domId || question.questionKey;
+    }
+
+    function findAiQuestion(questions, reference) {
+        const identity = aiQuestionControlKey(reference);
+        return questions.find(question => aiQuestionControlKey(question) === identity)
+            || findQuestionByReference(questions, reference);
+    }
+
+    function aiQuestionGrade(question, receipt) {
+        if (!question) return 'unknown';
+        const root = locateQuestionBlock(question);
+        if (root?.querySelector('.status.incorrect, .status.partially-correct, input.incorrect, input[aria-invalid="true"], [data-correct="false"]')) return 'incorrect';
+        if (question.correct) return 'correct';
+        const names = [...new Set((question.options || []).map(option => option.inputName).filter(Boolean))];
+        const grades = names.map(name => receipt?.correctMap?.[name] || receipt?.correctMap?.[name.replace(/^input_/, '').replace(/\[\]$/, '')])
+            .map(value => String(typeof value === 'string' ? value : value?.correctness || '').toLowerCase());
+        if (grades.some(value => /^(incorrect|partially[-_]correct)$/.test(value))) return 'incorrect';
+        if (grades.length && grades.every(value => value === 'correct')) return 'correct';
+        if (receipt) {
+            const score = receipt.currentScore == null ? NaN : Number(receipt.currentScore);
+            const total = receipt.totalPossible == null ? NaN : Number(receipt.totalPossible);
+            if (Number.isFinite(score) && total > 0 && score >= total) return 'correct';
+            if (Number.isFinite(score) && total > 0 && score === 0) return 'incorrect';
+            if (receipt.success === 'correct') return 'correct';
+            if (receipt.groupSize === 1 && (receipt.success === 'incorrect' || (total > 0 && score < total))) return 'incorrect';
+        }
+        // Some custom CAPA widgets expose only a problem-level score/status.
+        // Use that only after a confirmed submission, never from stale defaults.
+        if (receipt) {
+            const wrapper = root?.closest('.problems-wrapper[data-url]');
+            const feedback = wrapper?.querySelector('.notification-submit, .problem-results, .problem-progress');
+            const text = String(feedback?.textContent || '');
+            const match = text.match(/(\d+(?:[.,]\d+)?)\s*(?:\/|из|of)\s*(\d+(?:[.,]\d+)?)/i);
+            if (match) {
+                const score = Number(match[1].replace(',', '.')), total = Number(match[2].replace(',', '.'));
+                if (total > 0 && score >= total) return 'correct';
+                if (total > 0 && score === 0) return 'incorrect';
+            }
+        }
+        return 'unknown';
+    }
+
+    function aiQuestionCorrect(question) {
+        const confirmed = aiGradesByControl.get(aiQuestionControlKey(question));
+        if (confirmed) return confirmed === 'correct';
+        const root = locateQuestionBlock(question);
+        if (!root || root.querySelector('.status.incorrect, .status.partially-correct, [data-correct="false"]')) return false;
+        return Boolean(question.correct);
+    }
+
+    function aiAttempts(question) {
+        const root = locateQuestionBlock(question);
+        const wrapper = root?.closest('.problems-wrapper[data-url]');
+        const container = wrapper || getQuestionProblemContainer(question);
+        return window.ParamExtOpeneduAi.attempts({
+            used: container?.getAttribute('data-attempts-used'),
+            max: container?.getAttribute('data-max-attempts'),
+            text: container?.querySelector('.submission-feedback')?.textContent || '',
+            closed: container?.getAttribute('data-closed') === 'true'
+                || container?.querySelector('.submit')?.getAttribute('data-should-enable-submit-button') === 'False'
+        });
+    }
+
+    function aiSnapshot(questions) {
+        return questions.map(q => Object.assign({}, q, {
+            correct: aiQuestionCorrect(q), aiExhausted: aiAttempts(q).exhausted, aiControlKey: aiQuestionControlKey(q)
+        }));
+    }
+
+    function publishAiState() {
+        const questions = aiSnapshot(aiLocalQuestions());
+        iframeQuestionsCache = questions;
+        lastParsedQuestionCount = questions.length;
+        if (isTopFrame) lastRenderedQuestions = questions;
+        else syncIframeStateToTop(lastMergedStatsByQuestion || {}, questions, topFrameOnlineState);
+    }
+
+    function requestChatgpt(prompt) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                // Freeze this request's setting; later edits apply to the next request.
+                const answerTimeoutMs = Math.min(60, Math.max(1, Number(settings?.openedu?.chatgptAnswerTimeoutMinutes) || 10)) * 60000;
+                const requestTimeoutMs = answerTimeoutMs + 125000;
+                let response;
+                const deadline = Date.now() + requestTimeoutMs;
+                do {
+                    response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_AI_REQUEST', prompt, answerTimeoutMs });
+                    if (!response?.busy) break;
+                    await aiPause(2000);
+                } while (Date.now() < deadline && isChatgptAutoMode());
+                if (response?.error_type) {
+                    throw new Error('Extension message routing failed: ' + (response.error_message || response.error_name || 'legacy bus intercepted the AI request') + '. Reload the extension and course tab.');
+                }
+                if (response?.error) throw new Error(response.error);
+                if (!response?.id) throw new Error('AI background did not acknowledge the request. Reload the extension and course tab.');
+                const early = aiEarlyResults.get(response.id);
+                if (early) {
+                    aiEarlyResults.delete(response.id);
+                    if (early.error) reject(new Error(early.error)); else resolve(early.text);
+                    return;
+                }
+                const timer = setTimeout(() => {
+                    aiWaiters.delete(response.id);
+                    reject(new Error('ChatGPT timed out. Reload the course before retrying.'));
+                }, requestTimeoutMs);
+                aiWaiters.set(response.id, { resolve, reject, timer });
+            } catch (error) { reject(error); }
+        });
+    }
+
+    chrome.runtime.onMessage.addListener((message, sender) => {
+        if (sender.id !== chrome.runtime.id || message?.type !== 'PARAMEXT_AI_RESULT') return;
+        const waiter = aiWaiters.get(message.id);
+        if (!waiter) {
+            aiEarlyResults.set(message.id, message);
+            setTimeout(() => aiEarlyResults.delete(message.id), 5000);
+            return;
+        }
+        clearTimeout(waiter.timer);
+        aiWaiters.delete(message.id);
+        if (message.error) waiter.reject(new Error(message.error));
+        else waiter.resolve(message.text);
+    });
+
+    function submitAiProblem(question) {
+        const wrapper = locateQuestionBlock(question)?.closest('.problems-wrapper[data-url]');
+        if (!wrapper) return Promise.reject(new Error('Unsupported problem: no CAPA submission endpoint'));
+        return new Promise((resolve, reject) => {
+            const id = crypto.randomUUID();
+            wrapper.setAttribute('data-moodush-submit-id', id);
+            const cleanup = () => { clearTimeout(timer); window.removeEventListener('message', onResult); };
+            const onResult = event => {
+                if (event.source !== window || event.data?.type !== 'PARAMEXT_CAPA_RESULT' || event.data.id !== id) return;
+                cleanup();
+                if (event.data.error) reject(new Error(event.data.error));
+                else resolve(event.data);
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new Error('Submission outcome unknown. Reload the course before retrying.'));
+            }, 30000);
+            window.addEventListener('message', onResult);
+            lastSubmitActionAt = Date.now();
+            window.postMessage({ type: 'PARAMEXT_CAPA_SUBMIT', id, marker: id }, location.origin);
+        });
+    }
+
+    async function solveWithChatgpt(sectionKey, stats) {
+        if (aiGradeSection !== sectionKey) { aiGradesByControl.clear(); aiGradeSection = sectionKey; }
+        const history = [];
+        const generation = aiGeneration;
+        const assertCurrent = () => {
+            if (generation !== aiGeneration || !isChatgptAutoMode() || aiSectionKey(aiLocalQuestions()) !== sectionKey) {
+                throw new Error('AI workflow stopped because the page or mode changed');
+            }
+        };
+        for (let round = 0; round < 10; round++) {
+            assertCurrent();
+            let questions = aiSnapshot(aiLocalQuestions());
+            const pending = questions.filter(q => !q.correct && !q.aiExhausted);
+            if (!pending.length) { publishAiState(); return; }
+            const aiQuestions = [];
+            const payloads = new Map();
+            for (const question of pending) {
+                const known = round === 0 ? getAutoAnswerCandidates(stats?.[question.questionKey]) : [];
+                if (known.length) {
+                    const payload = questionAllowsMultipleAnswers(locateQuestionBlock(question)) ? known : [known[0]];
+                    payloads.set(question.questionKey, payload);
+                } else aiQuestions.push(question);
+            }
+            if (aiQuestions.length) {
+                const items = aiQuestions.map(q => ({ question: q, index: questions.findIndex(item => item.questionKey === q.questionKey), stats: stats?.[q.questionKey] }));
+                reportAiWorkflowStatus('ожидание ответа', false);
+                // Short request-local IDs avoid asking the model to reproduce long hashes.
+                const requested = items.map(item => ({
+                    questionKey: item.question.questionKey, responseKey: 'Q' + (item.index + 1),
+                    index: item.index + 1, options: item.question.options || [], type: item.question.questionType
+                }));
+                const wireItems = items.map((item, index) => ({ ...item,
+                    question: { ...item.question, questionKey: requested[index].responseKey }
+                }));
+                const wireFeedback = round && history.map(h => ({
+                    wrong: h.wrong.map(key => requested.find(q => q.questionKey === key)?.responseKey).filter(Boolean),
+                    answers: h.answers.filter(a => requested.some(q => q.questionKey === a.questionKey))
+                        .map(a => ({ ...a, questionKey: requested.find(q => q.questionKey === a.questionKey).responseKey }))
+                }));
+                let requestItems = wireItems;
+                let requestQuestions = requested;
+                let extra = round ? '\nПредыдущие попытки (только вопросы с оставшимися попытками): ' + JSON.stringify(wireFeedback)
+                    + '\nВопросы wrong — неверно. Исправь их; не повторяй прежние неверные ответы.' : '';
+                for (let repair = 0; repair < 3; repair++) {
+                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra);
+                    assertCurrent();
+                    try {
+                        const entries = window.ParamExtOpeneduAi.parseResponse(response,
+                            requestQuestions.map(q => q.questionKey), requestQuestions);
+                        entries.forEach(entry => payloads.set(entry.questionKey, normalizeImportedAnswerList(entry)));
+                        break;
+                    } catch (error) {
+                        if (!error.missingQuestionKeys || repair === 2) throw error;
+                        // Preserve validated answers, but spend no LMS attempt until
+                        // every pending question has a usable response.
+                        error.partialAnswers.forEach(entry => payloads.set(entry.questionKey, normalizeImportedAnswerList(entry)));
+                        const missing = new Set(error.missingQuestionKeys);
+                        requestQuestions = requested.filter(q => missing.has(q.questionKey));
+                        requestItems = wireItems.filter(item => requestQuestions.some(q => q.responseKey === item.question.questionKey));
+                        const labels = requestQuestions.map(q => q.responseKey).join(', ');
+                        reportAiWorkflowStatus('ответ неполный; запрашиваю ' + labels, false);
+                        extra = '\nВ предыдущем ответе отсутствовали ответы или были пустые answers для: ' + labels
+                            + '. Верни непустые answers для каждого вопроса ниже. Только эти вопросы. Не повторяй уже заполненные вопросы.';
+                    }
+                }
+            }
+            assertCurrent();
+            // Validate and apply all answers before spending any attempt in a problem group.
+            for (const question of pending) {
+                const label = 'Q' + (questions.findIndex(q => q.questionKey === question.questionKey) + 1);
+                reportAiWorkflowStatus('применение ответа ' + label, false);
+                aiGradesByControl.delete(aiQuestionControlKey(question));
+                const answers = payloads.get(question.questionKey);
+                if (!answers?.length || !requestApplyAnswers(question, answers, 'set-all')
+                    || !areAnswersAppliedToQuestion(question, answers)) {
+                    throw new Error('Could not apply AI answer for ' + label + ' (' + (question.questionType || 'unknown') + '): ' + String(question.prompt || '').slice(0, 160));
+                }
+            }
+            const receipts = new Map();
+            const problemKeys = new Map(pending.map(question => [question, getProblemAutoKey(question)]));
+            const groups = new Map();
+            for (const question of pending) groups.set(problemKeys.get(question), question);
+            for (const [problemKey, question] of groups) {
+                assertCurrent();
+                if (aiAttempts(question).exhausted) continue;
+                let ready = false;
+                for (let poll = 0; poll < 30; poll++) {
+                    assertCurrent();
+                    const wrapper = locateQuestionBlock(question)?.closest('.problems-wrapper[data-url]');
+                    const button = wrapper?.querySelector('.submit');
+                    if (button && !button.disabled && button.getAttribute('aria-disabled') !== 'true') { ready = true; break; }
+                    if (aiAttempts(question).exhausted) break;
+                    await aiPause(1000);
+                }
+                if (!ready) {
+                    if (aiAttempts(question).exhausted) continue;
+                    throw new Error('LMS submit action is unavailable or cooling down');
+                }
+                reportAiWorkflowStatus('отправка ответа в OpenEdu', false);
+                const receipt = await submitAiProblem(question);
+                if (receipt) receipts.set(problemKey, { ...receipt, groupSize: pending.filter(item => problemKeys.get(item) === problemKey).length });
+                await aiPause(800);
+            }
+            // Await rendered grading feedback, including asynchronous CAPA updates.
+            let waiting = true;
+            for (let poll = 0; poll < 30; poll++) {
+                assertCurrent();
+                questions = aiSnapshot(aiLocalQuestions());
+                waiting = pending.some(old => {
+                    const current = findAiQuestion(questions, old);
+                    if (current?.aiExhausted) return false;
+                    const grade = aiQuestionGrade(current, receipts.get(problemKeys.get(old)));
+                    if (current && grade !== 'unknown') {
+                        current.correct = grade === 'correct';
+                        aiGradesByControl.set(aiQuestionControlKey(current), grade);
+                    }
+                    return grade === 'unknown';
+                });
+                if (!waiting) break;
+                await aiPause(1000);
+            }
+            if (waiting) throw new Error('LMS has not returned a definite grade; automatic retries stopped');
+            const wrong = questions.filter(q => !q.correct && !q.aiExhausted).map(q => q.questionKey);
+            history.push({ wrong, answers: [...payloads].map(([questionKey, answers]) => ({ questionKey, answers })) });
+            publishAiState();
+            if (!wrong.length) return;
+            // Respect the LMS submit cooldown before asking for another answer.
+            await aiPause(1200);
+        }
+        throw new Error('AI retry limit reached (10 rounds). Reload to start a new run.');
+    }
+
+    function reportAiWorkflowStatus(text, error) {
+        setStickOnline(!error, 'ChatGPT: ' + text);
+        if (!isTopFrame) {
+            // The LMS iframe can be thousands of pixels tall. Its fixed error
+            // panel may be outside the visible course viewport; show it in top.
+            window.top.postMessage({ type: 'PARAMEXT_OPENEDU_AI_STATUS', frameId: frameSyncId, text, error: Boolean(error) }, '*');
+            return;
+        }
+        if (!error) {
+            document.getElementById('moodush-ai-error')?.remove();
+            return;
+        }
+        let notice = document.getElementById('moodush-ai-error');
+        if (!notice) {
+            notice = document.createElement('div');
+            notice.id = 'moodush-ai-error';
+            document.body.prepend(notice);
+            Object.assign(notice.style, { position: 'fixed', bottom: '12px', left: '12px', zIndex: '2147483647', background: '#331b1b', color: '#fff', padding: '12px', maxWidth: '550px' });
+        }
+        notice.textContent = 'ChatGPT: ' + text;
+    }
+
+    function runChatgptAutoActions(questions, stats) {
+        if (!isChatgptAutoMode() || aiRun) return;
+        const live = questions.filter(q => q.ownerDocument === document && !q.fromVirtualContent);
+        if (!live.length) return;
+        const key = aiSectionKey(live);
+        if (key === aiStoppedSection) return;
+        aiStoppedSection = key;
+        const generation = aiGeneration;
+        aiRun = solveWithChatgpt(key, stats).catch(error => {
+            // An obsolete run must not leave a cancellation banner over the new
+            // section/mode. Real failures in the current run are still visible.
+            if (generation !== aiGeneration || !isChatgptAutoMode() || aiSectionKey(aiLocalQuestions()) !== key) return;
+            reportAiWorkflowStatus(error.message, true);
+            debugSync('chatgpt_workflow_stopped', { error: error.message });
+        }).finally(() => { aiRun = null; publishAiState(); });
+    }
+
     function runOpeneduAutoActions(questions, statsByQuestion) {
+        if (isChatgptAutoMode()) {
+            runChatgptAutoActions(questions, statsByQuestion);
+            return;
+        }
         const localQuestions = (Array.isArray(questions) ? questions : [])
             .filter((question) => question?.ownerDocument === document);
         if (localQuestions.length === 0) {
@@ -6921,11 +7302,29 @@
         return merged;
     }
 
+    const inlineMenuDocuments = new WeakSet();
+    function closeInlineMenus(doc, except) {
+        doc.querySelectorAll('.' + INLINE_MENU_CLASS).forEach(menu => {
+            if (menu === except) return;
+            menu.classList.remove('is-open');
+            const popover = menu.querySelector('.moodush-openedu-inline-popover');
+            if (popover) popover.hidden = true;
+            menu.querySelector('.moodush-openedu-inline-wand')?.setAttribute('aria-expanded', 'false');
+        });
+    }
+
     function renderInlineWands(statsByQuestion, questions) {
         const activeKeys = new Set();
 
         const docsForCleanup = getSearchDocuments();
         docsForCleanup.forEach((doc) => {
+            if (!inlineMenuDocuments.has(doc)) {
+                inlineMenuDocuments.add(doc);
+                doc.addEventListener('click', event => {
+                    if (!(event.target instanceof Element) || !event.target.closest('.' + INLINE_MENU_CLASS)) closeInlineMenus(doc);
+                });
+                doc.addEventListener('keydown', event => { if (event.key === 'Escape') closeInlineMenus(doc); });
+            }
             const legacyButtons = doc.querySelectorAll('button[' + INLINE_WAND_ATTR + ']');
             legacyButtons.forEach((button) => {
                 if (!button.closest('.' + INLINE_MENU_CLASS)) {
@@ -6997,6 +7396,17 @@
 
             const popover = document.createElement('div');
             popover.className = 'moodush-openedu-inline-popover';
+            popover.hidden = !menu.classList.contains('is-open');
+            trigger.setAttribute('aria-expanded', String(!popover.hidden));
+            trigger.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                const open = !menu.classList.contains('is-open');
+                closeInlineMenus(menu.ownerDocument);
+                menu.classList.toggle('is-open', open);
+                popover.hidden = !open;
+                trigger.setAttribute('aria-expanded', String(open));
+            });
 
             const popTitle = document.createElement('div');
             popTitle.className = 'moodush-openedu-inline-title';
@@ -7257,6 +7667,49 @@
         return completedCount > 0 ? ('популярный · ' + completedCount) : 'популярный';
     }
 
+    function getAiTextInputPrompt(question) {
+        const options = (question.options || []).filter(option => option.inputType === 'text');
+        if (!options.length) return '';
+        const block = question.fromVirtualContent ? question.root : locateQuestionBlock(question);
+        if (!(block instanceof HTMLElement)) return '';
+        // A parsed subquestion may be only the input wrapper. Its sentence can
+        // span sibling text nodes, paragraphs, and other blanks in this problem.
+        const scope = block.closest('.problem')
+            || block.closest('.problems-wrapper[data-url], .xblock-student_view-problem') || block;
+        const controls = [...scope.querySelectorAll('input[type="text"], textarea')];
+        const targets = controls.filter(control => options.some(option =>
+            (option.inputId && control.id === option.inputId)
+            || (option.inputName && control.name === option.inputName)));
+        if (!targets.length) return '';
+        const clone = scope.cloneNode(true);
+        const markers = [];
+        [...clone.querySelectorAll('input[type="text"], textarea')].forEach((control, index) => {
+            const marker = (targets.includes(controls[index]) ? 'ANSWER ' : 'BLANK ') + (index + 1);
+            if (targets.includes(controls[index])) markers.push('[' + marker + ']');
+            control.replaceWith(clone.ownerDocument.createTextNode(' [' + marker + '] '));
+        });
+        clone.querySelectorAll([
+            PARAMEXT_WIDGET_SELECTOR, 'script', 'style', 'noscript', 'template', 'button', 'input', 'select',
+            '[hidden]', '[aria-hidden="true"]', '.status', '.status-icon', '.indicator-container',
+            '[id^="answer_"]', '.feedback', '.message', '.notification', '.solution', '.hint',
+            '.problem-progress', '.problem-results', '.submission-feedback', '.action', '.actions',
+            '.sr', '.sr-only', '.MathJax_Preview', '.MJX_Assistive_MathML', 'mjx-assistive-mml'
+        ].join(',')).forEach(node => node.remove());
+        // Keep boundaries between block elements without losing the text nodes
+        // on either side of an inline input. Do not read current input values.
+        const read = node => {
+            if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            if (node.tagName === 'BR') return ' ';
+            const text = [...node.childNodes].map(read).join('');
+            return /^(P|DIV|LI|TR|TD|TH|H[1-6]|LEGEND|FIELDSET|SECTION)$/.test(node.tagName) ? ' ' + text + ' ' : text;
+        };
+        const text = collapseWhitespace([read(clone), ...collectPromptMediaTokens(clone)].join(' '))
+            .replace(/\s+([,.;:!?])/g, '$1');
+        if (!text || !markers.every(marker => text.includes(marker))) return '';
+        return 'Заполни только ' + markers.join(', ') + '. Остальные [BLANK N] относятся к другим полям. ' + text;
+    }
+
     function buildQuestionAiExport(items) {
         return (Array.isArray(items) ? items : []).map((item) => {
             const question = item.question || {};
@@ -7265,7 +7718,7 @@
                 index: Number(item.index || 0) + 1,
                 questionKey: String(question.questionKey || ''),
                 type: String(question.questionType || 'unknown'),
-                prompt: collapseWhitespace(question.prompt || ''),
+                prompt: getAiTextInputPrompt(question) || collapseWhitespace(question.prompt || ''),
                 options: (Array.isArray(question.options) ? question.options : [])
                     .map((option) => ({
                         answerKey: String(option.answerKey || ''),
@@ -7289,6 +7742,8 @@
             'Используй options как список доступных вариантов. knownAnswers.verified уже подтверждены платформой, knownAnswers.popular могут быть подсказкой, knownAnswers.incorrect выбирать нельзя.',
             'Верни только валидный JSON без markdown. Формат строго такой:',
             '{"answers":[{"index":1,"questionKey":"...","answers":[{"answerKey":"...","answerText":"точный текст ответа"}]}]}',
+            'Копируй questionKey и index точно из каждого вопроса текущего списка. Не используй ID из предыдущих сообщений.',
+            'Ответь на каждый вопрос текущего списка. Массив answers каждого вопроса должен содержать хотя бы один ответ. Пустые answers недопустимы.',
             'Для matching/select/multiple_choice можно указывать несколько answers. Для text_input укажи строку ответа.',
             'Для matching обязательно сохраняй answerText рядом с answerKey: одинаковые технические id могут повторяться в разных вопросах.',
             '',
@@ -7883,7 +8338,8 @@
                 questionKey: question.questionKey,
                 frameId: frameSyncId,
                 domId: question.domId,
-                correct: question.correct,
+                correct: isChatgptAutoMode() ? aiQuestionCorrect(question) : question.correct,
+                aiExhausted: isChatgptAutoMode() && aiAttempts(question).exhausted,
                 hasVerifiedAnswer: question.hasVerifiedAnswer,
                 allowsMultipleAnswers: Boolean(question.allowsMultipleAnswers),
                 orderIndex: question.orderIndex,
@@ -7911,6 +8367,7 @@
             window.top.postMessage({
                 type: 'PARAMEXT_OPENEDU_QUESTIONS_SYNC',
                 frameId: frameSyncId,
+                pageKind: window.ParamExtOpeneduAi.classify(document),
                 stats: statsByQuestion,
                 questions: simplifiedQuestions
             }, '*');
@@ -7936,6 +8393,7 @@
         const source = String(options?.source || 'generic');
 
         if (cyclesStopped) {
+            if (isChatgptAutoMode()) runChatgptAutoActions(aiLocalQuestions(), lastMergedStatsByQuestion || {});
             return;
         }
 
@@ -7997,7 +8455,7 @@
                     usingTopIframeCache: Boolean(isTopFrame && topFrameIframeQuestions && topFrameIframeQuestions.length > 0)
                 });
 
-                if (isTopFrame && !hasTopFrameIframeQuestions()) {
+                if (isTopFrame && !isChatgptAutoMode() && !hasTopFrameIframeQuestions()) {
                     refreshActiveSequenceTabForEmptySection('cycle-no-questions');
                 }
 
@@ -8036,6 +8494,7 @@
                     source
                 });
 
+                runChatgptAutoActions(questions, buildLocalFallbackStats(questions));
                 renderInlineWands({}, []);
                 lastMergedStatsByQuestion = null;
                 lastRenderedQuestions = snapshotQuestionReferences(questions);
@@ -8072,6 +8531,7 @@
                     });
 
                     const localStatsByQuestion = buildLocalFallbackStats(questions);
+                    runChatgptAutoActions(questions, localStatsByQuestion);
                     const mergedStatsByQuestion = mergeStatsByQuestion(
                         null,
                         localStatsByQuestion,
@@ -8571,6 +9031,22 @@
             markSequenceNavigation('active-tab-changed', activeTabKey);
         }
 
+        if (isChatgptAutoMode()) {
+            const questions = aiSnapshot(aiLocalQuestions()).concat(topFrameIframeQuestions || []);
+            const settled = questions.length > 0 && questions.every(q => q.correct || q.aiExhausted);
+            const contentKind = window.ParamExtOpeneduAi.classify(document);
+            const knownContent = contentKind === 'theory' || contentKind === 'video'
+                || [...topFrameIframeSnapshots.values()].some(snapshot => ['video', 'theory'].includes(snapshot.pageKind));
+            const expectedFrames = [...document.querySelectorAll('iframe[src]')].filter(frame => {
+                try { return /(^|\.)openedu\.ru$/i.test(new URL(frame.src, location.href).hostname); } catch (_) { return false; }
+            });
+            const framesReady = expectedFrames.every(frame => [...topFrameIframeSnapshots.values()].some(snapshot => snapshot.source === frame.contentWindow && snapshot.updatedAt >= lastSequenceNavigationAt));
+            if (aiRun || !framesReady || Date.now() - lastSequenceNavigationAt < AUTO_ADVANCE_PARSE_WAIT_MS || (questions.length && !settled)) return;
+            if (!questions.length && (!knownContent || Date.now() - lastSequenceNavigationAt < AUTO_ADVANCE_PARSE_WAIT_MS)) return;
+            if (Date.now() - lastAutoAdvanceAt >= Number(settings.openedu.autoAdvanceDelayMs || 1800)) requestNextSequencePage();
+            return;
+        }
+
         const isComplete = isSequenceTabComplete(activeTab);
         if (!isComplete && settings.openedu.activeTabRefreshEnabled) {
             const noQuestionsOnCurrentSection = lastParsedQuestionCount === 0 && !hasTopFrameIframeQuestions();
@@ -8617,6 +9093,18 @@
     }
 
     function installPageMonitors() {
+        const invalidateGrade = event => {
+            const control = event.target;
+            if (!(control instanceof Element) || !control.matches('input, select, textarea')) return;
+            const wrapper = control.closest('.problems-wrapper[data-url]');
+            if (!wrapper || !control.name) return;
+            const prefix = (wrapper.getAttribute('data-problem-id') || wrapper.id || '') + '|';
+            for (const key of aiGradesByControl.keys()) {
+                if (key.startsWith(prefix) && key.slice(prefix.length).split('|').includes(control.name)) aiGradesByControl.delete(key);
+            }
+        };
+        document.addEventListener('input', invalidateGrade, true);
+        document.addEventListener('change', invalidateGrade, true);
         const handleManualAnswerInput = (event) => {
             if (!pendingManualAnswerQuestion || !isEventInsideQuestion(event, pendingManualAnswerQuestion)) {
                 return;
@@ -8797,6 +9285,13 @@
             if (hasSettingsChange) {
                 const previousSettings = settings;
                 settings = await window.ParamExtSettings.getSettings();
+                const aiModeChanged = previousSettings?.openedu?.mode !== settings?.openedu?.mode
+                    || previousSettings?.openedu?.missingAnswerAction !== settings?.openedu?.missingAnswerAction;
+                if (aiModeChanged) aiGeneration += 1;
+                if (aiModeChanged || !aiRun) {
+                    aiStoppedSection = '';
+                    document.getElementById('moodush-ai-error')?.remove();
+                }
                 const backendChanged =
                     String(previousSettings?.backend?.openedu?.apiBaseUrl || '') !== String(settings?.backend?.openedu?.apiBaseUrl || '')
                     || String(previousSettings?.backend?.openedu?.apiToken || '') !== String(settings?.backend?.openedu?.apiToken || '')
