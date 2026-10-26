@@ -7,6 +7,7 @@ const { JSDOM } = require('jsdom');
 function page(html) {
     const dom = new JSDOM(html, { url: 'https://courses.openedu.ru/courses/course-v1:test+test+2026/xblock/test', runScripts: 'outside-only' });
     dom.window.chrome = { runtime: { onMessage: { addListener() {} } } };
+    dom.window.eval(fs.readFileSync(require.resolve('../js/openedu_shared.js'), 'utf8'));
     dom.window.eval(fs.readFileSync(require.resolve('../js/openedu_reminders.js'), 'utf8'));
     return dom;
 }
@@ -125,6 +126,7 @@ test('saves silently once and clears saved-task state on navigation', async () =
         async sendMessage() { sends++; return { ok: true }; }
     } };
     try {
+        dom.window.eval(fs.readFileSync(require.resolve('../js/openedu_shared.js'), 'utf8'));
         dom.window.eval(fs.readFileSync(require.resolve('../js/openedu_reminders.js'), 'utf8'));
         await scheduled[0]();
         assert.equal(dom.window.document.getElementById('moodush-openedu-reminder'), null);
@@ -145,6 +147,7 @@ test('iframe save status is silent, ignores stale pages and expires when the uni
     let listener;
     dom.window.chrome = { runtime: { onMessage: { addListener(fn) { listener = fn; } } } };
     try {
+        dom.window.eval(fs.readFileSync(require.resolve('../js/openedu_shared.js'), 'utf8'));
         dom.window.eval(fs.readFileSync(require.resolve('../js/openedu_reminders.js'), 'utf8'));
         const api = dom.window.ParamExtOpeneduReminders;
         listener({ type: 'MOODUSH_OPENEDU_REMINDER_STATUS', pageUrl: base + '/old', frameUrl, result: { ok: true } });

@@ -6,13 +6,13 @@ const { JSDOM } = require('jsdom');
 const { chat } = require('./helpers/chatgpt_tab');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-for (const choiceType of ['radio', 'checkbox', 'matching']) {
+for (const choiceType of ['radio', 'checkbox', 'matching', 'mixed']) {
 test('full boot applies ' + choiceType + ' answers and activates the native submit action', async () => {
     const source = new JSDOM(`<!doctype html><body><div class="xblock-student_view-problem">
       <div class="problems-wrapper" id="problem_demo" data-problem-id="demo" data-url="/demo/handler/xmodule_handler" data-attempts-used="0">
         <div class="problem"><div class="wrapper-problem-response"><fieldset><legend>Choose the first option.</legend><div class="choicegroup">
-          <input id="input_demo_1_choice_0" name="input_demo_1" type="${choiceType}" value="choice_0"><label for="input_demo_1_choice_0">First option</label>
-          <input id="input_demo_1_choice_1" name="input_demo_1" type="${choiceType}" value="choice_1"><label for="input_demo_1_choice_1">Second option</label>
+          <input id="input_demo_1_choice_0" name="input_demo_1" type="${choiceType === 'mixed' ? 'radio' : choiceType}" value="choice_0"><label for="input_demo_1_choice_0">First option</label>
+          <input id="input_demo_1_choice_1" name="input_demo_1" type="${choiceType === 'mixed' ? 'radio' : choiceType}" value="choice_1"><label for="input_demo_1_choice_1">Second option</label>
           <span class="status unanswered">unanswered</span></div></fieldset></div></div>
         <button type="button" class="submit" disabled data-should-enable-submit-button="True">Отправить</button>
         <div class="submission-feedback">Вы использовали 0 из 2 попыток</div>
@@ -29,12 +29,15 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
             answers: Array.from({ length: 9 }, (_, i) => ({ id: 'answer' + i, title: 'Definition ' + i }))
         }));
     }
+    if (choiceType === 'mixed') w.document.body.insertAdjacentHTML('beforeend',
+        '<div class="problems-wrapper" data-problem-id="manual_task" data-url="/manual/handler/xmodule_handler"><div class="problem"><div class="jsinput"><fieldset><legend>UNSUPPORTED MANUAL TASK</legend><input type="radio" id="manual_choice" name="manual_choice"><label for="manual_choice">MANUAL ONLY</label></fieldset></div></div></div>');
+    const reminderTabs = [];
     const storage = { paramExtPlatformSettingsV2: { openedu: { mode: 'autoSolve', missingAnswerAction: 'chatgpt' } } };
     const sourceListeners = [], workerListeners = [], storageListeners = [];
     let opened = 0, submitted = 0;
     const errors = [];
     const chromeId = 'extension';
-    const sourceSender = { url: w.location.href, tab: { id: 3 }, frameId: 0 };
+    const sourceSender = { url: w.location.href, tab: { id: 3, url: 'https://courses.openedu.ru/courses/course-v1:test+test+2026/courseware/unit' }, frameId: 0 };
     const chatSender = { url: 'https://chatgpt.com/', tab: { id: 20 }, frameId: 0 };
     function route(message, sender) {
         return new Promise((resolve, reject) => {
@@ -61,13 +64,17 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
     });
     const session = {};
     const backgroundChrome = {
-        runtime: { onMessage: { addListener(fn) { workerListeners.push(fn); } } },
+        runtime: { getURL: path => 'chrome-extension://extension/' + path, onMessage: { addListener(fn) { workerListeners.push(fn); } } },
         storage: { session: {
             async get(keys) { const out = {}; for (const key of Array.isArray(keys) ? keys : [keys]) out[key] = session[key]; return out; },
             async set(value) { Object.assign(session, value); }, async remove(key) { delete session[key]; }
         } },
         tabs: {
-            async create() { opened++; return { id: 20, url: 'https://chatgpt.com/', status: 'loading' }; },
+            async create(properties) {
+                if (properties.url.startsWith('chrome-extension://')) { const tab = { id: 21, ...properties }; reminderTabs.push(tab); return tab; }
+                opened++; return { id: 20, url: 'https://chatgpt.com/', status: 'loading' };
+            },
+            async query() { return reminderTabs; },
             async get() { return { id: 20, url: 'https://chatgpt.com/', status: 'complete' }; },
             async update() {},
             async sendMessage(tab, message) {
@@ -93,6 +100,8 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
             }, onChanged: { addListener(listener) { storageListeners.push(listener); } }
         }
     };
+    backgroundChrome.storage.local = w.chrome.storage.local;
+    vm.runInNewContext(fs.readFileSync(require.resolve('../js/reminders_background.js'), 'utf8'), { chrome: backgroundChrome, URL });
     // The saved CAPA runtime recalculates this readiness on input clicks.
     for (const input of w.document.querySelectorAll('input')) input.addEventListener('click', () => {
         const required = choiceType === 'checkbox' ? 2 : 1;
@@ -140,6 +149,14 @@ test('full boot applies ' + choiceType + ' answers and activates the native subm
         assert.ok(c.inserted[0].includes(choiceType === 'matching' ? 'Author 0' : 'Choose the first option.'));
         assert.equal(submitted, 1);
         await new Promise(resolve => setTimeout(resolve, 900));
+        if (choiceType === 'mixed') {
+            assert.equal(storage.moodushOpeneduReminders.length, 1);
+            assert.equal(reminderTabs.length, 1);
+            assert.equal(reminderTabs[0].active, false);
+            assert.ok(!c.inserted[0].includes('UNSUPPORTED MANUAL TASK'));
+            assert.ok(!c.inserted[0].includes('MANUAL ONLY'));
+            assert.equal(w.document.getElementById('manual_choice').checked, false);
+        }
         assert.deepEqual(errors, []);
         assert.equal(w.document.getElementById('moodush-ai-error'), null);
     } finally { source.window.close(); c.dom.window.close(); }

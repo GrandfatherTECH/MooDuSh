@@ -1,20 +1,7 @@
 (function () {
     const HOST_RE = /(^|\.)openedu\.ru$/i;
     if (!HOST_RE.test(location.hostname)) return;
-    const MARKERS = '.jsinput, [data-block-type="lti"], [data-block-type="lti_consumer"], [data-block-type="drag-and-drop-v2"], [data-block-type="drag_and_drop_v2"], [data-block-type="openassessment"], [data-block-type="peerinstruction"]';
-
-    function findUnsupportedTasks(doc) {
-        // Inspect decoded problem markup as well: Open edX can mount it later.
-        const roots = [...doc.querySelectorAll('.problems-wrapper, [data-block-type="lti"], [data-block-type="lti_consumer"], [data-block-type="drag-and-drop-v2"], [data-block-type="drag_and_drop_v2"], [data-block-type="openassessment"], [data-block-type="peerinstruction"]')];
-        return roots.filter(root => {
-            if (root.matches(MARKERS) || root.querySelector(MARKERS)) return true;
-            const encoded = root.getAttribute('data-content');
-            if (!encoded) return false;
-            const template = doc.createElement('template');
-            template.innerHTML = encoded;
-            return Boolean(template.content.querySelector(MARKERS));
-        });
-    }
+    const findUnsupportedTasks = window.ParamExtOpeneduShared.findUnsupportedTasks;
 
     let timer;
     let lastSignature = '';

@@ -460,6 +460,11 @@
             return;
         }
 
+        if (!isTopFrame && event.source === window.top && event.data.type === 'PARAMEXT_OPENEDU_AI_RETRY') {
+            retryChatgptWorkflow();
+            return;
+        }
+
         if (isTopFrame) {
             if (event.data.type === 'PARAMEXT_OPENEDU_CONTEXT_REQUEST') {
                 try {
@@ -478,7 +483,7 @@
                 });
                 renderStick(topFrameIframeStats, topFrameIframeQuestions);
             } else if (event.data.type === 'PARAMEXT_OPENEDU_AI_STATUS') {
-                reportAiWorkflowStatus(String(event.data.text || ''), Boolean(event.data.error));
+                reportAiWorkflowStatus(String(event.data.text || ''), Boolean(event.data.error), event.source);
             } else if (event.data.type === 'PARAMEXT_OPENEDU_STICK_ONLINE') {
                 topFrameOnlineState = { online: Boolean(event.data.online), text: String(event.data.text || '') };
                 window.__PARAMEXT_TOPFRAME_ONLINE_STATE = topFrameOnlineState;
@@ -820,7 +825,8 @@
 
     function getTopContextPayload() {
         return Object.assign({}, getCourseContext(true), {
-            courseVerticals: openeduCourseVerticals
+            courseVerticals: openeduCourseVerticals,
+            unsupportedPage: getUnsupportedPageState()
         });
     }
 
@@ -2726,6 +2732,15 @@
             return mergePromptWithAdjacentContext(root, localPrompt);
         }
 
+        // CAPA can place the actual instruction immediately before a fieldset,
+        // outside the root selected for its radio buttons. Prefer that response
+        // paragraph over the outer LMS title (for example, "Шаг 5").
+        const response = root.closest('.wrapper-problem-response');
+        if (response && response !== root) {
+            const responsePrompt = getFirstPromptCandidate(response, [':scope > .problem-group-label', ':scope > legend', ':scope > p']);
+            if (responsePrompt) return mergePromptWithAdjacentContext(root, responsePrompt);
+        }
+
         const problemContainer = root.closest('.xblock-student_view-problem, [data-problem-id], .problems-wrapper, .vert');
         if (problemContainer instanceof HTMLElement && problemContainer !== root) {
             const containerPrompt = getFirstPromptCandidate(problemContainer, [
@@ -4192,7 +4207,11 @@
         });
 
         const dedupedBySignature = new Map();
+        const unsupportedByDocument = new Map();
         rawQuestions.forEach((question) => {
+            const doc = question.ownerDocument || document;
+            if (!unsupportedByDocument.has(doc)) unsupportedByDocument.set(doc, openeduShared.findUnsupportedTasks(doc));
+            if (unsupportedByDocument.get(doc).some(root => root === question.root || root.contains(question.root))) return;
             const previous = dedupedBySignature.get(question.signature);
             if (!previous) {
                 dedupedBySignature.set(question.signature, question);
@@ -4529,16 +4548,21 @@
     }
 
     function updateTopFrameIframeSnapshot(event) {
+        const previousUnsupportedState = JSON.stringify(getUnsupportedPageState());
         const now = Date.now();
         const sourceKey = getTopFrameIframeSourceKey(event);
         topFrameIframeSnapshots.set(sourceKey, {
             updatedAt: now,
             pageKind: event?.data?.pageKind || 'unknown',
+            hasUnsupportedTask: Boolean(event?.data?.hasUnsupportedTask),
             source: event.source,
             stats: event?.data?.stats && typeof event.data.stats === 'object' ? event.data.stats : {},
             questions: Array.isArray(event?.data?.questions) ? event.data.questions : []
         });
         rebuildTopFrameIframeAggregate(now);
+        if (JSON.stringify(getUnsupportedPageState()) !== previousUnsupportedState) {
+            broadcastTopContextUpdate('unsupported-page-state');
+        }
     }
 
     function clearTopFrameIframeSnapshots(source) {
@@ -4550,6 +4574,7 @@
         topFrameIframeQuestions = null;
         topFrameIframeStats = null;
         topFrameIframeSyncAt = 0;
+        broadcastTopContextUpdate('sequence-reset');
         debugSync('top_iframe_snapshots_cleared', {
             source: String(source || 'unknown')
         });
@@ -6530,7 +6555,7 @@
     }
 
     function maybeAutoApplyVerifiedAnswers(questions, statsByQuestion) {
-        if (!isOpeneduAutoInsertMode()) {
+        if (shouldSkipUnsupportedPage() || !isOpeneduAutoInsertMode()) {
             return { appliedCount: 0, readyCount: 0, knownCount: 0 };
         }
 
@@ -6592,6 +6617,7 @@
     }
 
     function maybeAutoSubmitSolvedQuestions(questions, statsByQuestion) {
+        if (shouldSkipUnsupportedPage()) return 0;
         if (!isOpeneduAutoSolveMode()) {
             return 0;
         }
@@ -6670,6 +6696,7 @@
     }
 
     function maybeAutoCheckInsertedAnswers(questions, statsByQuestion) {
+        if (shouldSkipUnsupportedPage()) return 0;
         if (!isOpeneduAutoCheckMode()) {
             return 0;
         }
@@ -6767,6 +6794,7 @@
     }
 
     function handleMissingAutoAnswers(questions, statsByQuestion) {
+        if (shouldSkipUnsupportedPage()) return;
         const action = getMissingAnswerAction();
         if (manualAnswerContinuationInFlight) {
             return;
@@ -6838,6 +6866,30 @@
     }
 
     let aiRun = null;
+
+    function getUnsupportedPageState() {
+        const hasLocalTask = Boolean(openeduShared.findUnsupportedTasks?.(document).length);
+        if (!isTopFrame) {
+            const state = window.__PARAMEXT_TOP_CONTEXT?.unsupportedPage;
+            return { hasUnsupportedTask: hasLocalTask || Boolean(state?.hasUnsupportedTask), ready: Boolean(state?.ready) };
+        }
+        const frames = [...document.querySelectorAll('iframe[src]')].filter(frame => {
+            try { return /(^|\.)openedu\.ru$/i.test(new URL(frame.src, location.href).hostname); } catch (_) { return false; }
+        });
+        const snapshots = frames.map(frame => [...topFrameIframeSnapshots.values()].find(snapshot =>
+            snapshot.source === frame.contentWindow && snapshot.updatedAt >= lastSequenceNavigationAt));
+        return {
+            hasUnsupportedTask: hasLocalTask || snapshots.some(snapshot => snapshot?.hasUnsupportedTask),
+            ready: snapshots.every(Boolean)
+        };
+    }
+
+    function shouldSkipUnsupportedPage() {
+        if (settings?.openedu?.unsupportedTaskAction !== 'skipPage') return false;
+        const state = getUnsupportedPageState();
+        // Pause automatic work until every course frame has reported its content.
+        return state.hasUnsupportedTask || !state.ready;
+    }
     let aiStoppedSection = '';
     let aiGeneration = 0;
     const aiGradesByControl = new Map();
@@ -7034,18 +7086,38 @@
         return images;
     }
 
-    async function requestChatgpt(prompt, items) {
-        const response = await requestChatgptOnce(prompt);
-        const value = JSON.parse(response);
-        if (value?.type !== 'visual_context_request') return response;
-        reportAiWorkflowStatus('снимки запрошенных вопросов', false);
-        const images = await captureAiQuestions(value, items);
-        const followup = prompt + '\nВложения содержат запрошенные снимки вопросов. Имена файлов связывают снимки с questionKey; несколько частей одного вопроса нужно рассматривать вместе.\n'
-            + 'Используй снимки и весь исходный список выше. Теперь верни один полный объединённый JSON {"answers":[...]} с ответами на КАЖДЫЙ вопрос исходного списка, включая вопросы без снимков. Не возвращай частичные ответы или новый visual_context_request.\n'
-            + 'Приложенные файлы: ' + images.map(image => image.name).join(', ');
-        const combined = await requestChatgptOnce(followup, images);
-        if (JSON.parse(combined)?.type === 'visual_context_request') throw new Error('ChatGPT still needs visual context after screenshots; no answers were applied');
-        return combined;
+    async function requestChatgpt(prompt, items, feedback = '') {
+        let response = await requestChatgptOnce(prompt);
+        let images = [];
+        const supplied = new Set();
+        for (let round = 0; ; round++) {
+            const value = JSON.parse(response);
+            if (value?.type !== 'visual_context_request') return response;
+            if (Object.hasOwn(value, 'answers') || !Array.isArray(value.questionKeys) || !value.questionKeys.length
+                || value.questionKeys.some(key => typeof key !== 'string' || !items.some(item => item.question.questionKey === key))) {
+                throw new Error('Invalid visual context request: expected current questionKeys without answers');
+            }
+            if (round >= 3) {
+                throw new Error('ChatGPT could not read the visual context after 3 screenshot follow-ups ('
+                    + value.questionKeys.join(', ') + '): ' + String(value.reason || 'No reason provided').slice(0, 500)
+                    + '. No answers were applied. Use Retry after checking the screenshots.');
+            }
+            const missing = [...new Set(value.questionKeys)].filter(key => !supplied.has(key));
+            reportAiWorkflowStatus(missing.length ? 'снимки запрошенных вопросов' : 'повторный запрос ответов по приложенным снимкам', false);
+            if (missing.length) {
+                images = images.concat(await captureAiQuestions({ ...value, questionKeys: missing }, items));
+                missing.forEach(key => supplied.add(key));
+            }
+            if (images.length > 12 || images.reduce((size, image) => size + image.dataUrl.length, 0) > 6000000) {
+                throw new Error('Question screenshots exceed the combined limit of 12 images / 6 MB');
+            }
+            // Build this stage afresh: do not repeat the initial instruction to
+            // request screenshots before answering. Retain grading/repair feedback.
+            const followup = buildAiPromptText(items, { visualContext: {
+                questionKeys: [...supplied], fileNames: images.map(image => image.name), reason: String(value.reason || '').slice(0, 500)
+            } }) + feedback;
+            response = await requestChatgptOnce(followup, images);
+        }
     }
 
     function requestChatgptOnce(prompt, images = []) {
@@ -7123,7 +7195,7 @@
         const history = [];
         const generation = aiGeneration;
         const assertCurrent = () => {
-            if (generation !== aiGeneration || !isChatgptAutoMode() || aiSectionKey(aiLocalQuestions()) !== sectionKey) {
+            if (generation !== aiGeneration || !isChatgptAutoMode() || shouldSkipUnsupportedPage() || aiSectionKey(aiLocalQuestions()) !== sectionKey) {
                 throw new Error('AI workflow stopped because the page or mode changed');
             }
         };
@@ -7162,7 +7234,7 @@
                 let extra = round ? '\nПредыдущие попытки (только вопросы с оставшимися попытками): ' + JSON.stringify(wireFeedback)
                     + '\nВопросы wrong — неверно. Исправь их; не повторяй прежние неверные ответы.' : '';
                 for (let repair = 0; repair < 3; repair++) {
-                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra, requestItems);
+                    const response = await requestChatgpt(buildAiPromptText(requestItems) + extra, requestItems, extra);
                     assertCurrent();
                     try {
                         const entries = window.ParamExtOpeneduAi.parseResponse(response,
@@ -7250,7 +7322,14 @@
         throw new Error('AI retry limit reached (10 rounds). Reload to start a new run.');
     }
 
-    function reportAiWorkflowStatus(text, error) {
+    function retryChatgptWorkflow() {
+        if (!isChatgptAutoMode() || aiRun) return;
+        aiStoppedSection = '';
+        document.getElementById('moodush-ai-error')?.remove();
+        runChatgptAutoActions(aiLocalQuestions(), lastMergedStatsByQuestion || {});
+    }
+
+    function reportAiWorkflowStatus(text, error, retryTarget = null) {
         setStickOnline(!error, 'ChatGPT: ' + text);
         if (!isTopFrame) {
             // The LMS iframe can be thousands of pixels tall. Its fixed error
@@ -7270,10 +7349,20 @@
             Object.assign(notice.style, { position: 'fixed', bottom: '12px', left: '12px', zIndex: '2147483647', background: '#331b1b', color: '#fff', padding: '12px', maxWidth: '550px' });
         }
         notice.textContent = 'ChatGPT: ' + text;
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'Повторить';
+        retry.style.marginLeft = '12px';
+        retry.addEventListener('click', () => {
+            if (retryTarget && retryTarget !== window) {
+                retryTarget.postMessage({ type: 'PARAMEXT_OPENEDU_AI_RETRY' }, '*');
+            } else retryChatgptWorkflow();
+        });
+        notice.appendChild(retry);
     }
 
     function runChatgptAutoActions(questions, stats) {
-        if (!isChatgptAutoMode() || aiRun) return;
+        if (!isChatgptAutoMode() || aiRun || shouldSkipUnsupportedPage()) return;
         const live = questions.filter(q => q.ownerDocument === document && !q.fromVirtualContent);
         if (!live.length) return;
         const key = aiSectionKey(live);
@@ -7283,13 +7372,14 @@
         aiRun = solveWithChatgpt(key, stats).catch(error => {
             // An obsolete run must not leave a cancellation banner over the new
             // section/mode. Real failures in the current run are still visible.
-            if (generation !== aiGeneration || !isChatgptAutoMode() || aiSectionKey(aiLocalQuestions()) !== key) return;
+            if (generation !== aiGeneration || !isChatgptAutoMode() || shouldSkipUnsupportedPage() || aiSectionKey(aiLocalQuestions()) !== key) return;
             reportAiWorkflowStatus(error.message, true);
             debugSync('chatgpt_workflow_stopped', { error: error.message });
         }).finally(() => { aiRun = null; publishAiState(); });
     }
 
     function runOpeneduAutoActions(questions, statsByQuestion) {
+        if (shouldSkipUnsupportedPage()) return;
         if (isChatgptAutoMode()) {
             runChatgptAutoActions(questions, statsByQuestion);
             return;
@@ -7834,7 +7924,7 @@
             return {
                 index: Number(item.index || 0) + 1,
                 questionKey: String(question.questionKey || ''),
-                type: String(question.questionType || 'unknown'),
+                type: String(question.questionType || enrichQuestionForV2(question).questionType || 'unknown'),
                 prompt: getAiTextInputPrompt(question) || collapseWhitespace(question.prompt || ''),
                 options: (Array.isArray(question.options) ? question.options : [])
                     .map((option) => ({
@@ -7852,15 +7942,22 @@
         });
     }
 
-    function buildAiPromptText(items) {
+    function buildAiPromptText(items, { visualContext = null } = {}) {
         const payload = buildQuestionAiExport(items);
         return [
             'Ниже список вопросов OpenEdu. Нужно определить правильные ответы.',
             'Используй options как список доступных вариантов. knownAnswers.verified уже подтверждены платформой, knownAnswers.popular могут быть подсказкой, knownAnswers.incorrect выбирать нельзя.',
-            'Сначала проверь, достаточно ли визуальной информации для ВСЕХ вопросов. Ссылки, имена файлов и alt-текст не заменяют изображения, графики, схемы или формулы.',
-            'Если для хотя бы одного вопроса недостаточно визуальной информации, НЕ отвечай ни на один вопрос на этом этапе. Верни ТОЛЬКО отдельный JSON следующего вида:',
-            '{"type":"visual_context_request","questionKeys":["точный questionKey нужного вопроса"],"reason":"какая визуальная информация нужна"}',
-            'Перечисли все вопросы, которым нужны снимки, в questionKeys. Не добавляй answers и не угадывай ответы. Расширение пришлёт снимки, после чего потребуется единый полный JSON ответов на весь исходный список.',
+            ...(visualContext ? [
+                'Это этап ответа ПОСЛЕ получения снимков. Изображения из списка ниже приложены к ЭТОМУ сообщению. Рассматривай все части одного вопроса вместе; используй сами изображения, а не только их имена, ссылки или alt-текст.',
+                'Используй снимки и весь исходный список ниже. Теперь верни один полный объединённый JSON {"answers":[...]} с ответами на КАЖДЫЙ вопрос исходного списка, включая вопросы без снимков.',
+                'Не запрашивай снимки заново лишь потому, что JSON вопроса содержит ссылку на изображение: проверь соответствующие вложения. Если конкретный снимок действительно отсутствует или нечитаем, верни только visual_context_request с questionKeys и точной причиной; не угадывай ответы.',
+                'Уже приложенный визуальный контекст: ' + JSON.stringify(visualContext)
+            ] : [
+                'Сначала проверь, достаточно ли визуальной информации для ВСЕХ вопросов. Ссылки, имена файлов и alt-текст не заменяют изображения, графики, схемы или формулы.',
+                'Если для хотя бы одного вопроса недостаточно визуальной информации, НЕ отвечай ни на один вопрос на этом этапе. Верни ТОЛЬКО отдельный JSON следующего вида:',
+                '{"type":"visual_context_request","questionKeys":["точный questionKey нужного вопроса"],"reason":"какая визуальная информация нужна"}',
+                'Перечисли все вопросы, которым нужны снимки, в questionKeys. Не добавляй answers и не угадывай ответы. Расширение пришлёт снимки, после чего потребуется единый полный JSON ответов на весь исходный список.',
+            ]),
             'Если информации достаточно, верни только валидный JSON без markdown. Формат ответов строго такой:',
             '{"answers":[{"index":1,"questionKey":"...","answers":[{"answerKey":"...","answerText":"точный текст ответа"}]}]}',
             'Копируй questionKey и index точно из каждого вопроса текущего списка. Не используй ID из предыдущих сообщений.',
@@ -8457,6 +8554,11 @@
         try {
             const simplifiedQuestions = (Array.isArray(questions) ? questions : []).map((question) => ({
                 questionKey: question.questionKey,
+                questionType: question.questionType,
+                questionFingerprint: question.questionFingerprint,
+                parserSource: question.parserSource,
+                parseConfidence: question.parseConfidence,
+                rawType: question.rawType,
                 frameId: frameSyncId,
                 domId: question.domId,
                 correct: isChatgptAutoMode() ? aiQuestionCorrect(question) : question.correct,
@@ -8489,6 +8591,7 @@
                 type: 'PARAMEXT_OPENEDU_QUESTIONS_SYNC',
                 frameId: frameSyncId,
                 pageKind: window.ParamExtOpeneduAi.classify(document),
+                hasUnsupportedTask: Boolean(openeduShared.findUnsupportedTasks?.(document).length),
                 stats: statsByQuestion,
                 questions: simplifiedQuestions
             }, '*');
@@ -9153,17 +9256,22 @@
             markSequenceNavigation('active-tab-changed', activeTabKey);
         }
 
+        if (settings?.openedu?.unsupportedTaskAction === 'skipPage'
+            && shouldSkipUnsupportedPage()
+            && !window.ParamExtOpeneduReminders?.hasSavedUnsupportedTask()) return;
+
         if (window.ParamExtOpeneduReminders?.hasSavedUnsupportedTask()) {
             // A reminder replaces the completion requirement for this task.
-            // Still wait for parsing and finish any supported questions sharing
-            // the section before moving on.
+            // In solve-supported mode, finish the supported questions first.
+            // Skip-page mode still waits for parsing and a saved reminder.
             if (!isAutoAdvanceEnabled() || aiRun) return;
             const expectedFrames = [...document.querySelectorAll('iframe[src]')].filter(frame => {
                 try { return /(^|\.)openedu\.ru$/i.test(new URL(frame.src, location.href).hostname); } catch (_) { return false; }
             });
             const framesReady = expectedFrames.every(frame => [...topFrameIframeSnapshots.values()].some(snapshot => snapshot.source === frame.contentWindow && snapshot.updatedAt >= lastSequenceNavigationAt));
             const questions = (isChatgptAutoMode() ? aiSnapshot(aiLocalQuestions()) : parseQuestions()).concat(topFrameIframeQuestions || []);
-            const unsettled = questions.some(q => !q.correct && !(isChatgptAutoMode() && q.aiExhausted));
+            const unsettled = settings?.openedu?.unsupportedTaskAction !== 'skipPage'
+                && questions.some(q => !q.correct && !(isChatgptAutoMode() && q.aiExhausted));
             if (!framesReady || unsettled || now - lastSequenceNavigationAt < AUTO_ADVANCE_PARSE_WAIT_MS) return;
             if (now - lastAutoAdvanceAt >= Number(settings.openedu.autoAdvanceDelayMs || 1800)) requestNextSequencePage();
             return;
@@ -9424,7 +9532,8 @@
                 const previousSettings = settings;
                 settings = await window.ParamExtSettings.getSettings();
                 const aiModeChanged = previousSettings?.openedu?.mode !== settings?.openedu?.mode
-                    || previousSettings?.openedu?.missingAnswerAction !== settings?.openedu?.missingAnswerAction;
+                    || previousSettings?.openedu?.missingAnswerAction !== settings?.openedu?.missingAnswerAction
+                    || previousSettings?.openedu?.unsupportedTaskAction !== settings?.openedu?.unsupportedTaskAction;
                 if (aiModeChanged) aiGeneration += 1;
                 if (aiModeChanged || !aiRun) {
                     aiStoppedSection = '';

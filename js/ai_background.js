@@ -17,6 +17,15 @@
             await chrome.tabs.sendMessage(job.sourceTab, { type: 'PARAMEXT_AI_RESULT', id: job.id, ...result }, { frameId: job.sourceFrame });
         } catch (_) { /* Source frame was closed or navigated. */ }
     }
+    async function retryDelivery(job, reason) {
+        const current = (await chrome.storage.session.get(KEY))[KEY];
+        if (!current || current.id !== job.id || current.dispatched) return;
+        const deliveryStartedAt = current.deliveryStartedAt ?? Date.now();
+        const queued = { ...current, deliveryStartedAt, dispatched: false };
+        await chrome.storage.session.set({ [KEY]: queued });
+        if (Date.now() - deliveryStartedAt < 30000) setTimeout(() => dispatch(queued), 500);
+        else await finish(queued, { error: reason + '. Reload the ChatGPT tab and retry. No answers were applied.' });
+    }
     async function dispatch(job) {
         if (dispatching) return;
         dispatching = true;
@@ -25,7 +34,8 @@
             if (!current || current.id !== job.id || current.dispatched) return;
             const tab = await chrome.tabs.get(job.aiTab);
             if (!isChatgpt(tab.url) || tab.status !== 'complete') return;
-            const acknowledgement = await chrome.tabs.sendMessage(job.aiTab, { type: 'PARAMEXT_CHATGPT_RUN', job: { id: job.id, prompt: job.prompt, images: job.images, answerTimeoutMs: answerTimeout(job.answerTimeoutMs) } });
+            if (current.deliveryStartedAt == null) await chrome.storage.session.set({ [KEY]: { ...current, deliveryStartedAt: Date.now() } });
+            const acknowledgement = await chrome.tabs.sendMessage(job.aiTab, { type: 'PARAMEXT_CHATGPT_RUN', job: { id: job.id, prompt: job.prompt, images: job.images, answerTimeoutMs: answerTimeout(job.answerTimeoutMs), resume: job.resume, mayHaveSent: job.mayHaveSent || ['sending', 'submitted'].includes(job.phase), userTurnId: job.userTurnId } }, { frameId: 0 });
             if (acknowledgement?.busy) {
                 // The previous result can reach OpenEdu before the tab adapter
                 // clears activeJob. Retry the queued request once it releases.
@@ -34,19 +44,17 @@
                 return;
             }
             if (acknowledgement?.ok !== true || acknowledgement.id !== job.id) {
-                throw new Error('ChatGPT adapter did not acknowledge the prompt');
+                await retryDelivery(job, acknowledgement?.error || 'ChatGPT adapter did not acknowledge the prompt');
+                return;
             }
             const latest = (await chrome.storage.session.get(KEY))[KEY];
-            if (latest?.id === job.id) await chrome.storage.session.set({ [KEY]: { ...latest, dispatched: true } });
+            if (latest?.id === job.id) await chrome.storage.session.set({ [KEY]: { ...latest, dispatched: true, phase: latest.phase || 'received', adapterInstance: acknowledgement.instanceId || latest.adapterInstance } });
         } catch (error) {
             if (/Receiving end does not exist|Could not establish connection/.test(error.message)) {
-                const current = (await chrome.storage.session.get(KEY))[KEY];
-                if (current?.id === job.id) await chrome.storage.session.set({ [KEY]: { ...current, dispatched: false } });
-                if (Date.now() - job.createdAt < 10000) setTimeout(() => dispatch(job), 500);
-                else await finish(job, { error: 'ChatGPT adapter did not load. Reload the ChatGPT tab.' });
+                await retryDelivery(job, 'ChatGPT adapter did not load');
                 return; // document_idle also signals readiness after injection.
             }
-            await finish(job, { error: 'ChatGPT tab unavailable. Reload the extension and ChatGPT tab: ' + error.message });
+            await finish(job, { error: 'ChatGPT request delivery failed: ' + error.message });
         } finally { dispatching = false; }
     }
     chrome.runtime.onMessage.addListener((message, sender, respond) => {
@@ -98,16 +106,39 @@
         if (message?.type === 'PARAMEXT_CHATGPT_READY' && isChatgpt(sender.url)) {
             (async () => {
                 const stored = await chrome.storage.session.get([KEY, TAB]);
-                const job = stored[KEY];
+                let job = stored[KEY];
+                if (job?.aiTab === sender.tab?.id && typeof message.instanceId === 'string'
+                    && job.dispatched && job.adapterInstance !== message.instanceId) {
+                    // A new document has no active run, even though the old
+                    // document acknowledged delivery before crashing/reloading.
+                    job = { ...job, dispatched: false, resume: true,
+                        mayHaveSent: job.mayHaveSent || !job.phase || ['sending', 'submitted'].includes(job.phase),
+                        adapterInstance: message.instanceId, deliveryStartedAt: Date.now() };
+                    await chrome.storage.session.set({ [KEY]: job });
+                }
                 if (job?.aiTab === sender.tab?.id) await dispatch(job);
                 return { ok: true, managed: stored[TAB] === sender.tab?.id };
+            })().then(respond).catch(error => respond({ error: error.message }));
+            return true;
+        }
+        if (message?.type === 'PARAMEXT_CHATGPT_PHASE' && isChatgpt(sender.url)) {
+            (async () => {
+                const job = (await chrome.storage.session.get(KEY))[KEY];
+                if (!job || job.id !== message.id || job.aiTab !== sender.tab?.id
+                    || !['sending', 'submitted'].includes(message.phase)
+                    || (job.adapterInstance && job.adapterInstance !== message.instanceId)) return { error: 'ChatGPT request is no longer active' };
+                await chrome.storage.session.set({ [KEY]: { ...job,
+                    phase: job.phase === 'submitted' ? 'submitted' : message.phase,
+                    adapterInstance: message.instanceId, userTurnId: message.userTurnId || job.userTurnId } });
+                return { ok: true };
             })().then(respond).catch(error => respond({ error: error.message }));
             return true;
         }
         if (message?.type === 'PARAMEXT_CHATGPT_RESULT' && isChatgpt(sender.url)) {
             (async () => {
                 const job = (await chrome.storage.session.get(KEY))[KEY];
-                if (job && job.id === message.id && job.aiTab === sender.tab?.id) {
+                if (job && job.id === message.id && job.aiTab === sender.tab?.id
+                    && (!job.adapterInstance || job.adapterInstance === message.instanceId)) {
                     await finish(job, { text: message.text, error: message.error });
                 }
             })().catch(() => {});

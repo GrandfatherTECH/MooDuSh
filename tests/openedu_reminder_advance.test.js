@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { JSDOM } = require('jsdom');
 
-function navigation({ chatgpt = false, saved = true, enabled = true, questions = [], ready = true, elapsed = 10000, running = false } = {}) {
+function navigation({ chatgpt = false, saved = true, enabled = true, questions = [], ready = true, elapsed = 10000, running = false, action = 'solveSupported' } = {}) {
     const dom = new JSDOM('<div class="sequence-navigation-tabs"><button class="active">Task</button></div><iframe src="https://courses.openedu.ru/xblock/unit"></iframe>', { url: 'https://apps.openedu.ru/learning/course/demo' });
     let next = 0;
     const frame = dom.window.document.querySelector('iframe');
@@ -14,7 +14,8 @@ function navigation({ chatgpt = false, saved = true, enabled = true, questions =
         URL, Date: { now: () => 20000 }, isTopFrame: true,
         lastSequenceTabKey: 'current', lastSequenceNavigationAt: 20000 - elapsed,
         lastAutoAdvanceAt: 0, AUTO_ADVANCE_PARSE_WAIT_MS: 9000,
-        settings: { openedu: { requiredCompletionOnly: true, activeTabRefreshEnabled: false, autoAdvanceDelayMs: 1800 } },
+        shouldSkipUnsupportedPage: () => true,
+        settings: { openedu: { unsupportedTaskAction: action, requiredCompletionOnly: true, activeTabRefreshEnabled: false, autoAdvanceDelayMs: 1800 } },
         getActiveSequenceTabKey: () => 'current', markSequenceNavigation() {},
         isChatgptAutoMode: () => chatgpt, isAutoAdvanceEnabled: () => enabled,
         aiRun: running ? {} : null, aiSnapshot: q => q, aiLocalQuestions: () => [], parseQuestions: () => [],
@@ -59,4 +60,20 @@ test('saved unsupported tasks do not trigger repeated empty-section refreshes', 
     const context = { window: { ParamExtOpeneduReminders: { hasSavedUnsupportedTask: () => true } } };
     vm.runInNewContext(content.slice(start, end), context);
     assert.doesNotThrow(() => context.refreshActiveSequenceTabForEmptySection('test'));
+});
+
+for (const chatgpt of [false, true]) {
+    test(`${chatgpt ? 'ChatGPT' : 'regular'} skip-page mode advances without solving supported questions after saving a reminder`, () => {
+        const p = navigation({ chatgpt, action: 'skipPage', questions: [{ correct: false }] });
+        try { assert.equal(p.run(), 1); } finally { p.close(); }
+    });
+    test(`${chatgpt ? 'ChatGPT' : 'regular'} skip-page mode still waits for frame readiness`, () => {
+        const p = navigation({ chatgpt, action: 'skipPage', ready: false, questions: [{ correct: false }] });
+        try { assert.equal(p.run(), 0); } finally { p.close(); }
+    });
+}
+
+test('skip-page mode waits for reminder persistence even when supported questions are already settled', () => {
+    const p = navigation({ chatgpt: true, action: 'skipPage', saved: false, questions: [{ correct: true }] });
+    try { assert.equal(p.run(), 0); } finally { p.close(); }
 });

@@ -376,7 +376,15 @@ test('repeated empty answers stop after two correction requests without spending
 });
 
 
-test('visual handshake captures requested questions and asks for combined answers to the original list', async () => {
+function installVisualTransport(w) {
+    const content = fs.readFileSync(require.resolve('../js/openedu_content.js'), 'utf8');
+    w.context.buildQuestionAiExport = items => items.map(({ question }) => question);
+    vm.runInContext(content.slice(content.indexOf('    function buildAiPromptText('), content.indexOf('    async function copyTextToClipboard(')), w.context);
+    vm.runInContext(content.slice(content.indexOf('    async function requestChatgpt('), content.indexOf('    function requestChatgptOnce(')), w.context);
+    vm.runInContext('requestChatgptOnce = onceMock; captureAiQuestions = captureMock;', w.context);
+}
+
+test('visual handshake captures requested questions and uses a separate answer-stage prompt', async () => {
     const w = workflow([{}, {}], [], () => {});
     const images = [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
     const calls = [], captures = [];
@@ -388,20 +396,117 @@ test('visual handshake captures requested questions and asks for combined answer
         assert.equal(w.applications.length, 0);
         return calls.length === 1 ? JSON.stringify({ type: 'visual_context_request', questionKeys: ['Q2'] }) : reply('Q1', 'Q2');
     };
-    vm.runInContext('requestChatgptOnce = onceMock; captureAiQuestions = captureMock;', w.context);
-    // workflow() normally substitutes the high-level transport for LMS tests;
-    // evaluate the actual wrapper here to exercise the visual protocol.
-    const content = fs.readFileSync(require.resolve('../js/openedu_content.js'), 'utf8');
-    vm.runInContext(content.slice(content.indexOf('    async function requestChatgpt(prompt, items)'), content.indexOf('    function requestChatgptOnce(')), w.context);
-    assert.equal(await vm.runInContext('requestChatgpt("Original Q1 Q2", visualItems)', w.context), reply('Q1', 'Q2'));
+    installVisualTransport(w);
+    assert.equal(await vm.runInContext('requestChatgpt("Original Q1 Q2", visualItems, " Grading feedback")', w.context), reply('Q1', 'Q2'));
     assert.equal(calls.length, 2);
     assert.equal(captures[0][1], items);
     assert.deepEqual(Array.from(captures[0][0].questionKeys), ['Q2']);
-    assert.equal(calls[1].attachments, images);
-    assert.ok(calls[1].prompt.startsWith('Original Q1 Q2'));
+    assert.deepEqual(Array.from(calls[1].attachments), images);
+    assert.match(calls[1].prompt, /ПОСЛЕ получения снимков/);
+    assert.ok(!calls[1].prompt.includes('Сначала проверь'));
+    assert.ok(!calls[1].prompt.includes('НЕ отвечай ни на один вопрос'));
+    assert.ok(calls[1].prompt.endsWith(' Grading feedback'));
+    assert.match(calls[1].prompt, /"questionKey": "Q1"/);
+    assert.match(calls[1].prompt, /"questionKey": "Q2"/);
     assert.match(calls[1].prompt, /КАЖДЫЙ вопрос исходного списка/);
     assert.match(calls[1].prompt, /question-Q2-1.png/);
-    w.context.onceMock = async () => JSON.stringify({ type: 'visual_context_request', questionKeys: ['Q2'] });
-    vm.runInContext('requestChatgptOnce = onceMock', w.context);
-    await assert.rejects(vm.runInContext('requestChatgpt("Original Q1 Q2", visualItems)', w.context), /still needs visual context/);
+});
+
+test('a repeated visual request retries the answer stage with existing images and can complete', async () => {
+    const w = workflow([{}, {}], [], () => {});
+    w.context.visualItems = [{ question: { questionKey: 'Q1' } }, { question: { questionKey: 'Q2' } }];
+    const images = [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
+    let captures = 0;
+    const calls = [];
+    w.context.captureMock = async () => { captures++; return images; };
+    w.context.onceMock = async (prompt, attachments) => {
+        calls.push({ prompt, attachments });
+        return calls.length < 3 ? JSON.stringify({ type: 'visual_context_request', questionKeys: ['Q2'], reason: 'Need the diagram' }) : reply('Q1', 'Q2');
+    };
+    installVisualTransport(w);
+    assert.equal(await vm.runInContext('requestChatgpt("Original", visualItems)', w.context), reply('Q1', 'Q2'));
+    assert.equal(calls.length, 3);
+    assert.equal(captures, 1);
+    assert.deepEqual(Array.from(calls[2].attachments), images);
+    assert.match(calls[2].prompt, /Need the diagram/);
+    assert.equal(w.applications.length, 0);
+    assert.equal(w.submissions.length, 0);
+});
+
+test('later requests can add another question without losing previously captured images', async () => {
+    const w = workflow([{}, {}], [], () => {});
+    w.context.visualItems = [{ question: { questionKey: 'Q1' } }, { question: { questionKey: 'Q2' } }];
+    const captures = [], calls = [];
+    w.context.captureMock = async value => {
+        captures.push(Array.from(value.questionKeys));
+        return value.questionKeys.map(key => ({ name: 'question-' + key + '-1.png', dataUrl: 'data:image/png;base64,YQ==' }));
+    };
+    w.context.onceMock = async (prompt, attachments) => {
+        calls.push({ prompt, attachments });
+        return calls.length < 3 ? JSON.stringify({ type: 'visual_context_request', questionKeys: calls.length === 1 ? ['Q2'] : ['Q1', 'Q2'] }) : reply('Q1', 'Q2');
+    };
+    installVisualTransport(w);
+    await vm.runInContext('requestChatgpt("Original", visualItems)', w.context);
+    assert.deepEqual(captures, [['Q2'], ['Q1']]);
+    assert.deepEqual(Array.from(calls[2].attachments, image => image.name), ['question-Q2-1.png', 'question-Q1-1.png']);
+});
+
+test('persistently unreadable context stops after three follow-ups with the model reason', async () => {
+    const w = workflow([{}], [], () => {});
+    w.context.visualItems = [{ question: { questionKey: 'Q1' } }];
+    let requests = 0, captures = 0;
+    w.context.captureMock = async () => { captures++; return [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }]; };
+    w.context.onceMock = async () => { requests++; return JSON.stringify({ type: 'visual_context_request', questionKeys: ['Q1'], reason: 'Diagram text is unreadable' }); };
+    installVisualTransport(w);
+    await assert.rejects(vm.runInContext('requestChatgpt("Original", visualItems)', w.context), /3 screenshot follow-ups \(Q1\).*Diagram text is unreadable/);
+    assert.equal(requests, 4);
+    assert.equal(captures, 1);
+    assert.equal(w.applications.length, 0);
+    assert.equal(w.submissions.length, 0);
+});
+
+test('later visual requests are validated and the accumulated screenshots stay within transport limits', async () => {
+    for (const failure of ['foreign', 'mixed', 'too-many']) {
+        const w = workflow([{}, {}], [], () => {});
+        w.context.visualItems = [{ question: { questionKey: 'Q1' } }, { question: { questionKey: 'Q2' } }];
+        let requests = 0, captures = 0;
+        w.context.captureMock = async () => {
+            captures++;
+            return Array.from({ length: failure === 'too-many' ? 7 : 1 }, (_, i) => ({ name: 'question-Q' + captures + '-' + i + '.png', dataUrl: 'data:image/png;base64,YQ==' }));
+        };
+        w.context.onceMock = async () => {
+            requests++;
+            return JSON.stringify({ type: 'visual_context_request', questionKeys: requests === 1 ? ['Q1'] : failure === 'foreign' ? ['Q999'] : ['Q2'],
+                ...(requests > 1 && failure === 'mixed' ? { answers: [] } : {}) });
+        };
+        installVisualTransport(w);
+        await assert.rejects(vm.runInContext('requestChatgpt("Original", visualItems)', w.context), failure === 'too-many' ? /combined limit/ : /Invalid visual context/);
+        assert.equal(requests, 2);
+        assert.equal(captures, failure === 'too-many' ? 2 : 1);
+        assert.equal(w.applications.length, 0);
+        assert.equal(w.submissions.length, 0);
+    }
+});
+
+test('error banner can restart the stopped section or route retry to the owning iframe', () => {
+    const w = workflow([{}], [], () => {});
+    const { JSDOM } = require('jsdom');
+    const dom = new JSDOM('<body></body>');
+    try {
+        w.context.document = dom.window.document;
+        w.q[0].ownerDocument = dom.window.document;
+        w.context.lastMergedStatsByQuestion = {};
+        let retries = 0;
+        w.context.runChatgptAutoActions = () => { retries++; };
+        vm.runInContext('aiStoppedSection = "stopped"; reportAiWorkflowStatus("Unreadable screenshot", true)', w.context);
+        dom.window.document.querySelector('#moodush-ai-error button').click();
+        assert.equal(retries, 1);
+        assert.equal(vm.runInContext('aiStoppedSection', w.context), '');
+        const messages = [];
+        w.context.retryFrame = { postMessage: message => messages.push(message) };
+        vm.runInContext('reportAiWorkflowStatus("Unreadable screenshot", true, retryFrame)', w.context);
+        dom.window.document.querySelector('#moodush-ai-error button').click();
+        assert.equal(messages[0].type, 'PARAMEXT_OPENEDU_AI_RETRY');
+        assert.equal(retries, 1, 'a child-frame error must retry in the child, not top');
+    } finally { dom.window.close(); }
 });

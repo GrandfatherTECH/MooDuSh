@@ -71,6 +71,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         openeduAutoUseFallbackAnswers: $('openeduAutoUseFallbackAnswers'),
         openeduAutoCheckAnswers: $('openeduAutoCheckAnswers'),
         openeduMissingAnswerAction: $('openeduMissingAnswerAction'),
+        openeduUnsupportedTaskAction: $('openeduUnsupportedTaskAction'),
         openeduChatgptAnswerTimeoutMinutes: $('openeduChatgptAnswerTimeoutMinutes'),
         openeduAutoAdvanceDelayMs: $('openeduAutoAdvanceDelayMs'),
         openeduDebugOverlay: $('openeduDebugOverlay'),
@@ -246,6 +247,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         refs.openeduAutoUseFallbackAnswers.checked = settings.openedu.autoUseFallbackAnswers;
         refs.openeduAutoCheckAnswers.checked = settings.openedu.autoCheckAnswers;
         refs.openeduMissingAnswerAction.value = settings.openedu.missingAnswerAction;
+        refs.openeduUnsupportedTaskAction.value = settings.openedu.unsupportedTaskAction;
         refs.openeduChatgptAnswerTimeoutMinutes.value = String(settings.openedu.chatgptAnswerTimeoutMinutes);
         refs.openeduAutoAdvanceDelayMs.value = String(settings.openedu.autoAdvanceDelayMs);
         refs.openeduDebugOverlay.checked = Boolean(settings.diagnostics?.openeduDebugOverlay);
@@ -302,6 +304,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         next.openedu.autoUseFallbackAnswers = refs.openeduAutoUseFallbackAnswers.checked;
         next.openedu.autoCheckAnswers = refs.openeduAutoCheckAnswers.checked;
         next.openedu.missingAnswerAction = refs.openeduMissingAnswerAction.value;
+        next.openedu.unsupportedTaskAction = refs.openeduUnsupportedTaskAction.value;
         next.openedu.chatgptAnswerTimeoutMinutes = Number(refs.openeduChatgptAnswerTimeoutMinutes.value || 10);
         next.openedu.autoAdvanceDelayMs = Math.max(500, Number(refs.openeduAutoAdvanceDelayMs.value || next.openedu.autoAdvanceDelayMs));
         next.diagnostics.openeduDebugOverlay = refs.openeduDebugOverlay.checked;
@@ -632,6 +635,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         refs.openeduAutoUseFallbackAnswers,
         refs.openeduAutoCheckAnswers,
         refs.openeduMissingAnswerAction,
+        refs.openeduUnsupportedTaskAction,
         refs.openeduChatgptAnswerTimeoutMinutes,
         refs.openeduDebugOverlay
     ].forEach((control) => {

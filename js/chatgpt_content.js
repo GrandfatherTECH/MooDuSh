@@ -1,5 +1,6 @@
 /* Browser-tab transport only; OpenEdu application stays in its internal functions. */
 (function () {
+    const instanceId = crypto.randomUUID();
     let activeJob = null;
     const received = new Set();
     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -47,8 +48,15 @@
         const marker = draft.lastIndexOf(' Request ID:');
         if (marker < 0) return false;
         const requestId = draft.slice(marker + ' Request ID:'.length).trim();
-        return /^[A-Za-z0-9_-]+$/.test(requestId)
-            && draft.slice(0, marker) === normalize(job.prompt);
+        if (!/^[A-Za-z0-9_-]+$/.test(requestId)) return false;
+        const expected = normalize(job.prompt);
+        if (draft.slice(0, marker) === expected) return true;
+        // Failed file uploads leave the extension's short wrapper in the
+        // composer. A retry gets a new request/file ID, but still owns that
+        // exact generated wrapper; do not mistake it for a user's draft.
+        const fileName = 'moodush-questions-' + job.id + '.txt';
+        return expected.includes(fileName) && draft.slice(0, marker)
+            === expected.replaceAll(fileName, 'moodush-questions-' + requestId + '.txt');
     }
 
     function findEditor() {
@@ -172,8 +180,7 @@
         return { text, json: answerJson(text) };
     }
 
-    function snapshotConversation() {
-        const turns = conversationTurns();
+    function snapshotConversation(turns = conversationTurns()) {
         return {
             nodes: new Set(turns.map(turn => turn.root)),
             ids: new Set(turns.filter(turn => turn.id).map(turn => turn.id)),
@@ -210,6 +217,7 @@
         }
         if (!send) throw new Error('ChatGPT send button is unavailable or disabled; the prompt was left in the editor');
         const before = snapshotConversation();
+        await reportPhase(jobId, 'sending');
         const form = editor.closest('form');
         if (form && send.form === form && send.type === 'submit' && typeof form.requestSubmit === 'function') {
             form.requestSubmit(send);
@@ -240,68 +248,231 @@
         throw new Error('ChatGPT did not confirm sending the prompt. Check the composer; automatic sending stopped.');
     }
 
-    async function attachImages(editor, images) {
-        if (!images?.length) return;
-        status('прикрепляю снимки вопросов');
-        const transfer = new DataTransfer();
-        for (const image of images) {
-            const bytes = Uint8Array.from(atob(image.dataUrl.split(',')[1]), char => char.charCodeAt(0));
-            transfer.items.add(new File([bytes], image.name, { type: 'image/png' }));
+    async function reportPhase(id, phase, userTurnId) {
+        const response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_PHASE', id, instanceId, phase, userTurnId });
+        if (response?.error) throw new Error(response.error);
+    }
+
+    const attachmentExclusions = '[data-message-author-role], [data-turn="user"], [data-turn="assistant"], [data-turn-key], [data-testid^="conversation-turn-"], [data-user-message-bubble], [data-chatgpt-search-unit-key], [data-content-search-unit-key], #moodush-chatgpt-status, script, style';
+    const attachmentSelector = 'img[src^="blob:"], img[src^="data:image"], [data-testid="attachment"], [data-testid="file-thumbnail"], button[aria-label*="Remove file"], button[aria-label*="Remove attachment"], button[aria-label*="Удалить файл"]';
+
+    function acceptsFile(input, file) {
+        return !input.disabled && (!input.accept || input.accept.split(',').some(value => {
+            const accept = value.trim().toLowerCase();
+            return accept === '*/*' || accept === file.type || (accept.endsWith('/*') && file.type.startsWith(accept.slice(0, -1)))
+                || (accept.startsWith('.') && file.name.toLowerCase().endsWith(accept));
+        }));
+    }
+
+    function findFileInput(editor, file) {
+        const inputs = [...document.querySelectorAll('input[type="file"]')].filter(input => !input.hasAttribute('capture'));
+        const form = editor.closest('form');
+        // Prefer the general Attach files control observed in the saved page,
+        // ahead of camera/media controls and unrelated uploaders elsewhere.
+        return inputs.find(input => form?.contains(input) && !input.accept && acceptsFile(input, file))
+            || inputs.find(input => form?.contains(input) && acceptsFile(input, file))
+            || inputs.find(input => !input.closest('form') && acceptsFile(input, file));
+    }
+
+    async function selectUploadFiles(editor, initialInput, files) {
+        const deadline = Date.now() + 5000;
+        let input = initialInput;
+        while (Date.now() < deadline) {
+            // An editor update can replace the picker between its discovery and
+            // this continuation. Never dispatch to a detached React input.
+            if (!input?.isConnected) input = findFileInput(findEditor() || editor, files[0]);
+            if (input && files.every(file => acceptsFile(input, file)) && (input.multiple || files.length === 1)) {
+                const transfer = new DataTransfer();
+                for (const file of files) transfer.items.add(file);
+                input.value = '';
+                input.files = transfer.files;
+                const selectedValue = input.value;
+                input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                const changeDispatched = input.isConnected;
+                if (changeDispatched) input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                // The ChatGPT handler in the page's referenced frontend bundle
+                // reads files and clears value synchronously. A retained native
+                // value means this selection did not reach that handler.
+                if (changeDispatched && (!selectedValue || input.value === '')) return;
+                const state = composerAttachments(findEditor() || editor, files);
+                if (state.named.size || state.pending || state.failure) return;
+            }
+            await pause(500);
+            input = findFileInput(findEditor() || editor, files[0]);
         }
-        const scope = editor.closest('form') || document;
-        const attachments = () => [...scope.querySelectorAll('img, [data-testid="attachment"], [data-testid="file-thumbnail"], button[aria-label*="Remove file"], button[aria-label*="Remove attachment"], button[aria-label*="Удалить файл"]')];
-        const previous = new Set(attachments());
-        const input = [...document.querySelectorAll('input[type="file"]')].find(node =>
-            !node.disabled && (node.multiple || images.length === 1)
-            && (!node.accept || /image|\.png|\*/i.test(node.accept)));
-        if (input) {
-            input.files = transfer.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-        } else {
-            editor.focus();
-            editor.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+        throw new Error('ChatGPT did not handle the file selection. Its upload control is not ready; no answer request was sent.');
+    }
+
+    async function revealFileInput(editor, file) {
+        // ChatGPT can mount its upload input only after opening the attachment
+        // menu. A synthetic paste of a document is not a file-upload fallback.
+        let menuOpened = false, menuClicked = false;
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+            const input = findFileInput(findEditor() || editor, file);
+            if (input) return input;
+            if (!menuOpened) {
+                const add = [...document.querySelectorAll('[data-testid="composer-plus-btn"], [data-testid="attach-button"], button[aria-label]')]
+                    .find(node => node.getClientRects().length && !node.disabled && node.getAttribute('aria-disabled') !== 'true'
+                        && (node.matches('[data-testid="composer-plus-btn"], [data-testid="attach-button"]')
+                            || /^(?:attach|add (?:photos|files)|прикрепить|добавить (?:фото|файл))/i.test(node.getAttribute('aria-label') || '')));
+                if (add) { menuOpened = true; add.click(); }
+            }
+            const item = !menuClicked && [...document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="dialog"] button')]
+                .find(node => node.getClientRects().length && !node.disabled
+                    && /^(?:add photos (?:&|and) files|upload (?:a file|files|from computer)|добавить фото и файлы|загрузить (?:файл|с компьютера))/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+            if (item) { menuClicked = true; item.click(); }
+            await pause(100);
         }
+        return null;
+    }
+
+    function composerAttachments(editor, files) {
+        const named = new Map();
+        // File chips are not necessarily inside the form and document uploads
+        // need not expose image thumbnails or an attachment data-testid.
+        // Match their real filename, excluding the composer instruction itself
+        // and previous conversation turns that may mention the same filename.
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                if (node.nodeType === Node.ELEMENT_NODE && (node === editor || node.matches('[hidden], [aria-hidden="true"]') || (node.matches(attachmentExclusions) && !node.contains(editor)))) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            let text = node.nodeType === Node.TEXT_NODE ? node.textContent :
+                ['title', 'aria-label', 'data-file-name', 'data-filename'].map(attr => node.getAttribute(attr) || '').join(' ');
+            // A filename can be split into basename/extension or nested spans.
+            // Read small labels as a whole, without aggregating the composer,
+            // hidden labels or old conversation turns into attachment evidence.
+            if (node.nodeType === Node.ELEMENT_NODE && node.childElementCount > 0 && node.childElementCount <= 6
+                && !node.contains(editor)
+                && !node.querySelector(attachmentExclusions + ', [hidden], [aria-hidden="true"], textarea, [contenteditable="true"]')) {
+                const label = node.textContent || '';
+                if (label.length <= 512) text += ' ' + label;
+            }
+            if (!text) continue;
+            files.forEach((file, index) => {
+                // Some cards display the extension separately from the basename.
+                const basename = file.name.replace(/\.[^.]+$/, '');
+                if (text.includes(file.name) || (basename.length >= 8 && text.includes(basename))) named.set(index, node.nodeType === Node.TEXT_NODE ? node.parentElement : node);
+            });
+        }
+        const visible = node => (!node.closest(attachmentExclusions) || node.closest(attachmentExclusions).contains(editor)) && !editor.contains(node)
+            && !node.closest('[hidden], [aria-hidden="true"]') && node.getClientRects().length > 0;
+        const thumbnails = [...document.querySelectorAll(attachmentSelector)].filter(visible);
+        const region = (editor.closest('form') || editor.parentElement).parentElement;
+        const cards = [...named.values()].map(node => node.closest('[data-file-id], [data-testid*="attachment"], [data-testid*="file"]') || node.parentElement);
+        const pending = [...document.querySelectorAll('[role="progressbar"], progress, [data-testid*="upload-progress"], [data-upload-state="uploading"], [data-state="uploading"]')]
+            .some(node => visible(node) && (region?.contains(node) || cards.some(card => card?.contains(node))));
+        const failure = [...named.values()].map(node => node.closest('[data-file-id], [data-testid*="attachment"], [data-testid*="file"]') || node.parentElement)
+            .find(card => /(?:upload failed|failed to upload|error uploading|file too large|не удалось загрузить|ошибка загрузки|файл слишком большой)/i.test(card?.textContent || ''));
+        return { named, thumbnails, pending, failure };
+    }
+
+    async function attachFiles(editor, files) {
+        if (!files.length) return editor;
+        status('прикрепляю файлы запроса');
+        // Baseline thumbnails only. Do not walk the full conversation before
+        // the upload has even started.
+        const previous = new Set(document.querySelectorAll(attachmentSelector));
+        const remaining = [...files];
+        while (remaining.length) {
+            editor = findEditor() || editor;
+            const file = remaining[0];
+            const input = await revealFileInput(editor, file);
+            if (!input && !file.type.startsWith('image/')) {
+                throw new Error('ChatGPT document upload input is unavailable for ' + file.name + '. The request file was not attached or sent.');
+            }
+            // Document and image pickers can be separate, and some pickers
+            // accept only one file. Deliver compatible batches to each handler.
+            const batch = input ? remaining.filter(candidate => acceptsFile(input, candidate)).slice(0, input.multiple ? undefined : 1)
+                : remaining.filter(candidate => candidate.type.startsWith('image/'));
+            status('загружаю: ' + batch.map(candidate => candidate.name).join(', '));
+            if (input) {
+                await selectUploadFiles(editor, input, batch);
+            } else {
+                const transfer = new DataTransfer();
+                for (const candidate of batch) transfer.items.add(candidate);
+                editor.focus();
+                editor.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+            }
+            batch.forEach(candidate => remaining.splice(remaining.indexOf(candidate), 1));
+            // React may replace both the composer and file input after change.
+            await pause(100);
+        }
+        status('ожидаю подтверждение загрузки файлов');
         const deadline = Date.now() + 60000;
         let readySince = 0;
+        let lastState;
         while (Date.now() < deadline) {
-            const added = attachments().filter(node => !previous.has(node));
-            // A single attachment can expose both a thumbnail and a remove
-            // button. Do not count those as two uploaded screenshots.
-            const count = Math.max(new Set(added.filter(node => node.tagName === 'IMG').map(node => node.src)).size,
+            const currentEditor = findEditor() || editor;
+            const state = composerAttachments(currentEditor, files);
+            lastState = state;
+            if (state.failure) throw new Error('ChatGPT could not upload the attachment: ' + state.failure.textContent.trim().slice(0, 240));
+            const added = state.thumbnails.filter(node => !previous.has(node));
+            const imageCount = Math.max(new Set(added.filter(node => node.tagName === 'IMG').map(node => node.src)).size,
                 added.filter(node => node.tagName === 'BUTTON').length,
                 added.filter(node => node.hasAttribute('data-testid')).length);
-            const pending = scope.querySelector('[role="progressbar"], [data-testid*="upload-progress"], [aria-busy="true"]');
-            if (count >= images.length && !pending && findSend(editor)) {
+            const documents = files.filter(file => !file.type.startsWith('image/')).length;
+            const namedDocuments = files.filter((file, index) => !file.type.startsWith('image/') && state.named.has(index)).length;
+            const confirmed = state.named.size === files.length || (namedDocuments === documents
+                && imageCount >= files.length - documents);
+            if (confirmed && !state.pending && findSend(currentEditor)) {
                 if (!readySince) readySince = Date.now();
-                if (Date.now() - readySince >= 1500) return;
+                if (Date.now() - readySince >= 1500) return currentEditor;
             } else readySince = 0;
             await pause(500);
         }
-        throw new Error('Could not confirm screenshot attachments in ChatGPT. No answer request was sent.');
+        throw new Error('Could not confirm screenshot attachments or prompt file in ChatGPT (filenames: ' + (lastState?.named.size || 0) + '/' + files.length + ', uploading: ' + Boolean(lastState?.pending) + ', send ready: ' + Boolean(findSend(findEditor() || editor)) + '). No answer request was sent.');
     }
 
     async function run(job) {
         const editorDeadline = Date.now() + 30000;
-        let editor;
-        status('запрос получен, ожидаю поле ввода ChatGPT');
+        let editor, before;
+        status(job.resume ? 'восстанавливаю запрос после перезагрузки' : 'запрос получен, ожидаю поле ввода ChatGPT');
         while (Date.now() < editorDeadline) {
-            editor = findEditor();
-            if (editor && !streaming()) break;
+            const turns = conversationTurns();
+            const userIndex = turns.findIndex(turn => turn.role === 'user'
+                && ((job.userTurnId && turn.id === job.userTurnId) || turn.text.includes('Request ID: ' + job.id)));
+            if (userIndex >= 0) { before = snapshotConversation(turns.slice(0, userIndex)); break; }
+            if (!job.mayHaveSent) {
+                editor = findEditor();
+                if (editor && !streaming()) break;
+            }
             await pause(500);
         }
-        if (!editor || streaming()) throw new Error('ChatGPT editor is unavailable. Check sign-in, verification, or an unfinished response.');
-        const hasDraft = Boolean(editorText(editor));
-        if (hasDraft && !isMatchingJobDraft(editor, job)) {
-            throw new Error('ChatGPT composer contains an unrelated unsent message. Move or send that draft, then reload the OpenEdu page to retry.');
+        if (!before) {
+            if (job.mayHaveSent) throw new Error('The previously sent request is not visible after reload. Open its ChatGPT conversation and retry from the course. The prompt was not sent again.');
+            if (!editor || streaming()) throw new Error('ChatGPT editor is unavailable. Check sign-in, verification, or an unfinished response.');
+            // A large insertText transaction in the rich editor can freeze the
+            // renderer. Upload the original prompt intact instead of expanding
+            // thousands of JSON lines into ProseMirror paragraphs.
+            const useFile = !(editor instanceof HTMLTextAreaElement) && job.prompt.length > 12000;
+            const fileName = 'moodush-questions-' + job.id + '.txt';
+            const composerText = useFile
+                ? 'Прочитай файл ' + fileName + ': он содержит полный запрос, инструкции, вопросы и варианты ответов. Выполни его целиком. Верни только запрошенный JSON; не пропускай вопросы. Если приложены снимки, используй их вместе с файлом.'
+                : job.prompt;
+            const hasDraft = Boolean(editorText(editor));
+            if (hasDraft && !isMatchingJobDraft(editor, { ...job, prompt: composerText }) && !isMatchingJobDraft(editor, job)) {
+                throw new Error('ChatGPT composer contains an unrelated unsent message. Move or send that draft, then reload the OpenEdu page to retry.');
+            }
+            const prompt = composerText + '\nRequest ID: ' + job.id;
+            status(hasDraft ? 'возобновляю оставшийся запрос MooDuSh' : 'вставляю запрос');
+            insertPrompt(editor, prompt);
+            const files = useFile ? [new File([job.prompt], fileName, { type: 'text/plain' })] : [];
+            for (const image of job.images || []) {
+                const bytes = Uint8Array.from(atob(image.dataUrl.split(',')[1]), char => char.charCodeAt(0));
+                files.push(new File([bytes], image.name, { type: 'image/png' }));
+            }
+            editor = await attachFiles(editor, files);
+            if (!samePrompt(editor, prompt)) throw new Error('ChatGPT changed the composer draft during upload; automatic sending stopped.');
+            before = await sendPrompt(editor, prompt, job.id);
+            await reportPhase(job.id, 'submitted', currentExchange(job.id, before).user?.id);
         }
-        const prompt = job.prompt + '\nRequest ID: ' + job.id;
-        status(hasDraft ? 'возобновляю оставшийся запрос MooDuSh' : 'вставляю запрос');
-        insertPrompt(editor, prompt);
-        await attachImages(editor, job.images);
-        const before = await sendPrompt(editor, prompt, job.id);
         status('запрос отправлен, ожидаю ответ');
         const deadline = Date.now() + Math.min(3600000, Math.max(60000, Number(job.answerTimeoutMs) || 600000));
-        let last = '', stableAt = Date.now();
+        let last = '', lastReply = null, cachedOutput = null, stableAt = Date.now();
         while (Date.now() < deadline) {
             await pause(750);
             const exchange = currentExchange(job.id, before);
@@ -314,15 +485,17 @@
                 throw new Error('ChatGPT accepted the prompt, but generation was cancelled (Stopped thinking). No answers were applied.');
             }
             if (['error', 'failed'].includes(state)) throw new Error('ChatGPT accepted the prompt, but generation failed. No answers were applied.');
-            const output = assistantOutput(reply);
-            const value = output.text.trim();
-            if (value !== last) { last = value; stableAt = Date.now(); }
             const turn = exchange.reply?.root;
             const completed = turn?.querySelector('[data-testid="copy-turn-action-button"], [data-testid="good-response-turn-action-button"], [data-testid="bad-response-turn-action-button"]');
             const running = ['running', 'thinking', 'streaming', 'pending', 'queued', 'in_progress', 'in-progress'].includes(state);
             const finished = ['completed', 'complete', 'done', 'finished', 'success', 'succeeded'].includes(state);
             if ((completed || finished) && !running && !streaming()) {
-                if (output.json && Date.now() - stableAt > 3000) return output.json;
+                const value = reply.textContent || '';
+                if (value !== last || reply !== lastReply) {
+                    last = value; lastReply = reply; stableAt = Date.now();
+                    cachedOutput = assistantOutput(reply);
+                }
+                if (cachedOutput?.json && Date.now() - stableAt > 3000) return cachedOutput.json;
                 // Completion controls can belong to an intermediate thinking
                 // block. Missing JSON is not a terminal result: allow the final
                 // answer to mount until the response deadline.
@@ -333,19 +506,21 @@
 
     function accept(job) {
         if (!job || typeof job.id !== 'string' || typeof job.prompt !== 'string') return { error: 'Invalid ChatGPT job' };
-        if (received.has(job.id)) return { ok: true, id: job.id };
+        if (received.has(job.id)) return { ok: true, id: job.id, instanceId };
         if (activeJob) return { busy: true, id: activeJob };
         activeJob = job.id;
         received.add(job.id);
-        run(job).then(text => {
+        // Acknowledge the job before touching the composer. Large matching
+        // prompts can make editor updates expensive; delivery is a separate step.
+        Promise.resolve().then(() => run(job)).then(text => {
             status('ответ получен, возвращаюсь к OpenEdu');
-            return chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_RESULT', id: job.id, text });
+            return chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_RESULT', id: job.id, instanceId, text });
         }).catch(error => {
             status(error.message, true);
-            return chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_RESULT', id: job.id, error: error.message });
+            return chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_RESULT', id: job.id, instanceId, error: error.message });
         }).catch(error => status('связь с расширением прервана: ' + error.message, true))
             .finally(() => { activeJob = null; });
-        return { ok: true, id: job.id };
+        return { ok: true, id: job.id, instanceId };
     }
 
     // Install the receiver before announcing readiness. Re-announcement recovers
@@ -357,7 +532,7 @@
     const readyUntil = Date.now() + 30000;
     async function announceReady() {
         try {
-            const response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_READY' });
+            const response = await chrome.runtime.sendMessage({ type: 'PARAMEXT_CHATGPT_READY', instanceId });
             if (response?.managed && !activeJob && received.size === 0) status('соединение установлено, ожидаю запрос');
         } catch (_) { /* Extension may be reloading. */ }
         if (!activeJob && received.size === 0 && Date.now() < readyUntil) setTimeout(announceReady, 1000);

@@ -20,10 +20,16 @@ function chat(options = {}) {
         }
     };
     function mount() {
-        const form = w.document.createElement('form');
-        const editor = options.contenteditable ? w.document.createElement('div') : w.document.createElement('textarea');
+        let form = w.document.createElement('form');
+        if (options.savedComposer) {
+            const template = w.document.createElement('template');
+            template.innerHTML = fs.readFileSync(require.resolve('../fixtures/chatgpt-upload-composer.html'), 'utf8');
+            form = template.content.querySelector('form');
+        }
+        const editor = options.savedComposer ? form.querySelector('[contenteditable="true"]')
+            : options.contenteditable ? w.document.createElement('div') : w.document.createElement('textarea');
         if (options.alternateEditor) { editor.setAttribute('contenteditable', 'true'); editor.setAttribute('role', 'textbox'); }
-        else editor.id = 'prompt-textarea';
+        else if (!options.savedComposer) editor.id = 'prompt-textarea';
         if (options.contenteditable) editor.setAttribute('contenteditable', 'true');
         if (options.draft) editor.textContent = options.draft;
         if (options.paragraphEdits) {
@@ -33,9 +39,8 @@ function chat(options = {}) {
                 return true;
             };
         }
-        const send = w.document.createElement('button');
-        send.id = 'composer-submit-button';
-        send.type = options.formSubmit ? 'submit' : 'button';
+        const send = options.savedComposer ? form.querySelector('button[type="submit"]') : w.document.createElement('button');
+        if (!options.savedComposer) { send.id = 'composer-submit-button'; send.type = options.formSubmit ? 'submit' : 'button'; }
         if (options.hiddenDecoy) {
             const decoy = send.cloneNode(); decoy.hidden = true; decoy.disabled = false;
             form.appendChild(decoy);
@@ -82,10 +87,11 @@ function chat(options = {}) {
             } else w.document.body.append(user, article);
             if ('value' in editor) editor.value = ''; else editor.textContent = '';
         };
-        send.addEventListener('click', () => { if (!options.enterOnly && !options.formSubmit && !options.noAcceptance) performSend(); });
+        send.addEventListener('click', () => { if (!options.enterOnly && !options.formSubmit && !options.savedComposer && !options.noAcceptance) performSend(); });
         form.addEventListener('submit', event => { event.preventDefault(); if (!options.noAcceptance) performSend(); });
         editor.addEventListener('keydown', event => { if (event.key === 'Enter' && options.enterOnly) { event.preventDefault(); performSend(); } });
-        form.append(editor, send); w.document.body.appendChild(form);
+        if (!options.savedComposer) form.append(editor, send);
+        w.document.body.appendChild(form);
         return editor;
     }
     if (!options.late) mount();
@@ -103,7 +109,7 @@ function chat(options = {}) {
     return {
         dom, w, messages, inserted, mount, advance,
         get sends() { return sendCount; },
-        deliver(id = 'job', prompt = 'Solve these questions', answerTimeoutMs = options.answerTimeoutMs) { let ack; receiver({ type: 'PARAMEXT_CHATGPT_RUN', job: { id, prompt, answerTimeoutMs, images: options.images } }, { id: 'extension' }, response => { ack = response; }); return ack; }
+        deliver(id = 'job', prompt = 'Solve these questions', answerTimeoutMs = options.answerTimeoutMs, extra = {}) { let ack; receiver({ type: 'PARAMEXT_CHATGPT_RUN', job: { id, prompt, answerTimeoutMs, images: options.images, ...extra } }, { id: 'extension' }, response => { ack = response; }); return ack; }
     };
 }
 

@@ -28,7 +28,7 @@ function worker(storage, sent, options = {}) {
                 async query() { return [{ id: options.activeTab ?? 3 }]; },
                 async captureVisibleTab(...args) { options.captures?.push(args); return 'data:image/png;base64,YQ=='; },
                 async update(...args) { options.updates?.push(args); },
-                async sendMessage(...args) { sent.push(args); if (options.busyCount > 0) { options.busyCount--; return { busy: true }; } return options.noAcknowledgement ? undefined : { ok: true, id: args[1].job?.id }; },
+                async sendMessage(...args) { sent.push(args); if (options.busyCount > 0) { options.busyCount--; return { busy: true }; } return options.noAcknowledgement ? undefined : { ok: true, id: args[1].job?.id, instanceId: options.instanceId }; },
                 onUpdated: { addListener(fn) { updated = fn; } },
                 onRemoved: { addListener() {} }
             }
@@ -89,14 +89,33 @@ test('new tab is dispatched even if its load events fire before the job is saved
     assert.equal(sent.filter(entry => entry[1].type === 'PARAMEXT_CHATGPT_RUN').length, 1);
 });
 
-test('an unacknowledged delivery is reported instead of silently marked dispatched', async () => {
-    const storage = {}, sent = [];
-    const w = worker(storage, sent, { noAcknowledgement: true });
-    await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'question' }, source);
-    assert.notEqual(storage.paramExtAiJob?.dispatched, true);
-    assert.ok(sent.some(entry => entry[1].type === 'PARAMEXT_AI_RESULT' && /acknowledge/.test(entry[1].error)));
+test('an unacknowledged delivery retries the same request in the top ChatGPT frame', async () => {
+    const storage = {}, sent = [], timers = [];
+    const options = { noAcknowledgement: true, now: 0, schedule: callback => timers.push(callback) };
+    const w = worker(storage, sent, options);
+    const response = await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'question' }, source);
+    assert.equal(storage.paramExtAiJob.dispatched, false);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0][2].frameId, 0);
+    options.noAcknowledgement = false;
+    timers.shift()(); await flush();
+    assert.equal(storage.paramExtAiJob.id, response.id);
+    assert.equal(storage.paramExtAiJob.dispatched, true);
+    assert.equal(sent[1][1].job.id, response.id);
 });
 
+test('persistent missing acknowledgements stop after a bounded retry window', async () => {
+    const storage = {}, sent = [], timers = [];
+    const options = { noAcknowledgement: true, now: 0, schedule: callback => timers.push(callback) };
+    const w = worker(storage, sent, options);
+    await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'question' }, source);
+    options.now = 30001;
+    timers.shift()(); await flush();
+    assert.equal(storage.paramExtAiJob, undefined);
+    assert.match(sent.at(-1)[1].error, /did not acknowledge/);
+    assert.ok(!sent.at(-1)[1].error.includes('tab unavailable'));
+    assert.equal(timers.length, 0);
+});
 
 test('send failures notify OpenEdu without switching away from the failed ChatGPT composer', async () => {
     const storage = {}, sent = [], updates = [];
@@ -192,4 +211,38 @@ test('manifest grants the explicit all-URLs permission required for automatic sc
     // automated capture after switching back from ChatGPT.
     assert.ok(manifest.host_permissions.includes('<all_urls>'),
         'Automatic screenshots require <all_urls> in host_permissions');
+});
+
+test('a new ChatGPT document resumes a delivered unsent request instead of leaving it stuck', async () => {
+    const storage = {}, sent = [];
+    const w = worker(storage, sent, { instanceId: 'old-document' });
+    const response = await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'pending' }, source);
+    const sender = { url: 'https://chatgpt.com/c/test', tab: { id: 20 } };
+    const restarted = worker(storage, sent, { instanceId: 'new-document' });
+    await restarted.request({ type: 'PARAMEXT_CHATGPT_READY', instanceId: 'new-document' }, sender);
+    const jobs = sent.filter(entry => entry[1].type === 'PARAMEXT_CHATGPT_RUN');
+    assert.equal(jobs.length, 2);
+    assert.equal(jobs[1][1].job.id, response.id);
+    assert.equal(jobs[1][1].job.resume, true);
+    assert.equal(jobs[1][1].job.mayHaveSent, false);
+    assert.equal(storage.paramExtAiJob.adapterInstance, 'new-document');
+    await restarted.request({ type: 'PARAMEXT_CHATGPT_READY', instanceId: 'new-document' }, sender);
+    assert.equal(sent.filter(entry => entry[1].type === 'PARAMEXT_CHATGPT_RUN').length, 2);
+});
+
+test('recovery retains send progress and rejects results from the previous document', async () => {
+    const storage = {}, sent = [];
+    const w = worker(storage, sent, { instanceId: 'old-document' });
+    const response = await w.request({ type: 'PARAMEXT_AI_REQUEST', prompt: 'pending' }, source);
+    const sender = { url: 'https://chatgpt.com/c/test', tab: { id: 20 } };
+    await w.request({ type: 'PARAMEXT_CHATGPT_PHASE', id: response.id, instanceId: 'old-document', phase: 'submitted', userTurnId: 'turn-1' }, sender);
+    const restarted = worker(storage, sent, { instanceId: 'new-document' });
+    await restarted.request({ type: 'PARAMEXT_CHATGPT_READY', instanceId: 'new-document' }, sender);
+    const job = sent.filter(entry => entry[1].type === 'PARAMEXT_CHATGPT_RUN').at(-1)[1].job;
+    assert.equal(job.mayHaveSent, true);
+    assert.equal(job.userTurnId, 'turn-1');
+    restarted.message({ type: 'PARAMEXT_CHATGPT_RESULT', id: response.id, instanceId: 'old-document', error: 'stale error' }, sender);
+    await flush(); assert.equal(storage.paramExtAiJob.id, response.id);
+    restarted.message({ type: 'PARAMEXT_CHATGPT_RESULT', id: response.id, instanceId: 'new-document', text: '{"answers":[]}' }, sender);
+    await flush(); assert.equal(storage.paramExtAiJob, undefined);
 });

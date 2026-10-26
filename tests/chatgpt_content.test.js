@@ -352,23 +352,115 @@ test('visual context JSON is returned without waiting for or fabricating answers
     } finally { c.dom.window.close(); }
 });
 
-function mockImageUpload(c, confirm = true) {
+function mockImageUpload(c, confirm = true, accept = 'image/*') {
     class Transfer {
         constructor() { this.files = []; this.items = { add: file => this.files.push(file) }; }
     }
     c.w.DataTransfer = Transfer;
-    const input = c.w.document.createElement('input'); input.type = 'file'; input.multiple = true; input.accept = 'image/*';
+    const input = c.w.document.createElement('input'); input.type = 'file'; input.multiple = true; input.accept = accept;
     Object.defineProperty(input, 'files', { value: [], writable: true });
     input.addEventListener('change', () => {
         if (!confirm) return;
         for (const file of input.files) {
-            const image = c.w.document.createElement('img'); image.src = 'blob:' + file.name;
-            c.w.document.querySelector('form').appendChild(image);
+            if (file.type === 'text/plain') {
+                // Document chips use plain text and an icon, outside the form;
+                // they need neither an img nor an attachment data-testid.
+                const card = c.w.document.createElement('div');
+                const name = c.w.document.createElement('span'); name.textContent = file.name.replace(/\.txt$/, '');
+                const type = c.w.document.createElement('span'); type.textContent = 'TXT';
+                const remove = c.w.document.createElement('button'); remove.type = 'button'; remove.setAttribute('aria-label', 'Remove');
+                card.append(name, type, remove); c.w.document.body.appendChild(card);
+            } else {
+                const image = c.w.document.createElement('img'); image.src = 'blob:' + file.name;
+                c.w.document.querySelector('form').appendChild(image);
+            }
         }
     });
     c.w.document.querySelector('form').appendChild(input);
     return input;
 }
+
+function nativePickerSelection(input) {
+    let files = [];
+    // Unlike the old writable-files mock, native file inputs acquire a nonempty
+    // value after assignment, and clearing value also clears their FileList.
+    Object.defineProperty(input, 'files', { configurable: true, get: () => files, set: value => { files = [...value]; } });
+    Object.defineProperty(input, 'value', { configurable: true,
+        get: () => files.length ? 'C:\\fakepath\\' + files[0].name : '',
+        set: value => { if (value === '') files = []; }
+    });
+}
+
+function uploadedCards(c, files) {
+    const tray = c.w.document.querySelector('[data-composer-attachments]');
+    for (const file of files) {
+        const card = c.w.document.createElement('div'); card.dataset.fileId = 'uploaded-' + file.name;
+        card.textContent = file.name; tray.appendChild(card);
+    }
+}
+
+test('saved composer retries an unhandled native selection until ChatGPT consumes the full request', async () => {
+    const c = chat({ contenteditable: true, savedComposer: true, paragraphEdits: true,
+        images: [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+    try {
+        mockImageUpload(c, false).remove(); // Install DataTransfer, not another picker.
+        const input = c.w.document.querySelector('input[aria-label="Attach files"]');
+        nativePickerSelection(input);
+        const selected = [], events = [];
+        input.addEventListener('input', () => events.push('input'));
+        input.addEventListener('change', () => events.push('change'));
+        c.w.setTimeout(() => input.addEventListener('change', () => {
+            selected.push([...input.files]); input.value = ''; uploadedCards(c, selected.at(-1));
+        }), 1200);
+        const prompt = 'Full instructions and all questions: ' + 'x'.repeat(94000);
+        c.deliver('saved-upload', prompt); await c.advance(10000);
+        assert.equal(selected.length, 1, 'only one selection is consumed by the application');
+        assert.equal(selected[0].length, 2);
+        assert.equal(selected[0][0].name, 'moodush-questions-saved-upload.txt');
+        assert.equal(selected[0][1].name, 'question-Q1-1.png');
+        assert.ok(events.length > 2, 'the first unhandled selection must be retried');
+        assert.deepEqual(events.slice(0, 2), ['input', 'change']);
+        const text = await new Promise(resolve => {
+            const reader = new c.w.FileReader(); reader.onload = () => resolve(reader.result); reader.readAsText(selected[0][0]);
+        });
+        assert.equal(text, prompt);
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('saved composer reacquires a picker replaced by the input event before change', async () => {
+    const c = chat({ contenteditable: true, savedComposer: true });
+    try {
+        mockImageUpload(c, false).remove();
+        const original = c.w.document.querySelector('input[aria-label="Attach files"]');
+        nativePickerSelection(original);
+        let staleChanges = 0, accepted = 0;
+        original.addEventListener('change', () => staleChanges++);
+        original.addEventListener('input', () => {
+            const replacement = original.cloneNode(); nativePickerSelection(replacement);
+            replacement.addEventListener('change', () => {
+                accepted++; const files = [...replacement.files]; replacement.value = ''; uploadedCards(c, files);
+            });
+            original.replaceWith(replacement);
+        }, { once: true });
+        c.deliver('replaced-picker', 'questions '.repeat(2000)); await c.advance(10000);
+        assert.equal(staleChanges, 0);
+        assert.equal(accepted, 1);
+        assert.equal(c.sends, 1);
+    } finally { c.dom.window.close(); }
+});
+
+test('an ignored native file selection fails explicitly without waiting for nonexistent attachments', async () => {
+    const c = chat({ contenteditable: true, savedComposer: true });
+    try {
+        mockImageUpload(c, false).remove();
+        nativePickerSelection(c.w.document.querySelector('input[aria-label="Attach files"]'));
+        c.deliver('ignored-selection', 'questions '.repeat(2000)); await c.advance(6500);
+        assert.equal(c.sends, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /did not handle the file selection/);
+    } finally { c.dom.window.close(); }
+});
 
 test('follow-up sends only after the screenshot attachments appear in the composer', async () => {
     const images = [{ name: 'question-Q2-1.png', dataUrl: 'data:image/png;base64,YQ==' }];
@@ -390,5 +482,289 @@ test('an unconfirmed screenshot upload stops before sending the follow-up', asyn
         c.deliver(); await c.advance(62000);
         assert.equal(c.sends, 0);
         assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT').error, /confirm screenshot attachments/);
+    } finally { c.dom.window.close(); }
+});
+
+
+test('large matching prompts are acknowledged before composer work and are sent only once', async () => {
+    const c = chat();
+    try {
+        const prompt = 'Matching options: ' + 'x'.repeat(94000);
+        assert.equal(c.deliver('large-job', prompt).ok, true);
+        assert.equal(c.inserted.length, 0, 'delivery acknowledgement must precede expensive editor updates');
+        c.deliver('large-job', prompt);
+        await c.advance(6500);
+        assert.equal(c.sends, 1);
+        assert.ok(c.inserted[0].includes(prompt));
+        c.deliver('large-job', prompt); await c.advance(1000);
+        assert.equal(c.sends, 1);
+    } finally { c.dom.window.close(); }
+});
+
+test('large rich-editor prompts are uploaded intact as text files with a short composer message', async () => {
+    const c = chat({ contenteditable: true, paragraphEdits: true, images: [{ name: 'question-Q1-1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+    const prompt = 'Original full instructions and questions: ' + 'x'.repeat(94000);
+    try {
+        const input = mockImageUpload(c, true, '*/*');
+        c.deliver('large-file', prompt); await c.advance(9000);
+        assert.equal(c.sends, 1);
+        assert.ok(c.inserted.every(text => text.length < 1000), 'the rich editor must never receive the large payload');
+        assert.equal(input.files.length, 2);
+        assert.equal(input.files[1].name, 'question-Q1-1.png');
+        assert.equal(input.files[0].type, 'text/plain');
+        assert.equal(input.files[0].name, 'moodush-questions-large-file.txt');
+        const text = await new Promise((resolve, reject) => {
+            const reader = new c.w.FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsText(input.files[0]);
+        });
+        assert.equal(text, prompt);
+        assert.ok(c.inserted[0].includes(input.files[0].name));
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('lazy attachment menu mounts separate document and image inputs before mixed upload', async () => {
+    const c = chat({ contenteditable: true, images: [{ name: 'question-Q1.png', dataUrl: 'data:image/png;base64,YQ==' }] });
+    try {
+        const documents = mockImageUpload(c, true, '.txt'); documents.remove();
+        const images = mockImageUpload(c, true, 'image/*'); images.remove();
+        const add = c.w.document.createElement('button'); add.type = 'button'; add.dataset.testid = 'composer-plus-btn';
+        let menuClicks = 0, pasteEvents = 0;
+        c.w.document.addEventListener('paste', () => pasteEvents++);
+        add.onclick = () => {
+            const item = c.w.document.createElement('button'); item.setAttribute('role', 'menuitem'); item.textContent = 'Add photos & files';
+            item.onclick = () => { menuClicks++; c.w.document.querySelector('form').append(documents, images); item.remove(); };
+            c.w.document.body.appendChild(item);
+        };
+        c.w.document.querySelector('form').appendChild(add);
+        const prompt = 'Full questions '.repeat(2000);
+        c.deliver('lazy-files', prompt); await c.advance(9000);
+        assert.equal(menuClicks, 1);
+        assert.equal(pasteEvents, 0, 'documents must use the document upload handler');
+        assert.equal(documents.files.length, 1);
+        assert.equal(documents.files[0].name, 'moodush-questions-lazy-files.txt');
+        assert.equal(images.files.length, 1);
+        assert.equal(images.files[0].name, 'question-Q1.png');
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('a single-file picker uploads screenshots one at a time', async () => {
+    const c = chat({ images: [1, 2].map(n => ({ name: 'question-' + n + '.png', dataUrl: 'data:image/png;base64,YQ==' })) });
+    try {
+        const input = mockImageUpload(c); input.multiple = false;
+        const batches = [];
+        input.addEventListener('change', () => batches.push([...input.files].map(file => file.name)));
+        c.deliver(); await c.advance(9000);
+        assert.deepEqual(batches, [['question-1.png'], ['question-2.png']]);
+        assert.equal(c.sends, 1);
+    } finally { c.dom.window.close(); }
+});
+
+test('upload waits for a document input mounted after the prompt editor updates', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        const input = mockImageUpload(c, true, '.txt'); input.remove();
+        c.w.document.querySelector('#prompt-textarea').addEventListener('input', () => {
+            c.w.setTimeout(() => c.w.document.querySelector('form').appendChild(input), 300);
+        });
+        c.deliver('delayed-picker', 'questions '.repeat(2000)); await c.advance(9000);
+        assert.equal(input.files[0].name, 'moodush-questions-delayed-picker.txt');
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('missing document picker reports the upload stage without silently pasting a file', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        let pastes = 0;
+        c.w.document.addEventListener('paste', () => pastes++);
+        c.deliver('no-picker', 'questions '.repeat(2000)); await c.advance(4000);
+        assert.equal(pastes, 0);
+        assert.equal(c.sends, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /document upload input is unavailable/);
+    } finally { c.dom.window.close(); }
+});
+
+test('failed large-prompt upload stops visibly and never falls back to a giant editor insertion', async () => {
+    const c = chat({ contenteditable: true, paragraphEdits: true });
+    try {
+        mockImageUpload(c, false, '*/*');
+        c.deliver('upload-failed', 'x'.repeat(94000)); await c.advance(62000);
+        assert.equal(c.sends, 0);
+        assert.ok(c.inserted.every(text => text.length < 1000));
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /confirm screenshot attachments or prompt file/);
+    } finally { c.dom.window.close(); }
+});
+
+test('a reloaded adapter reads the existing answer without editing or sending another message', async () => {
+    const c = chat({ late: true });
+    try {
+        c.w.document.body.insertAdjacentHTML('beforeend', '<div data-message-author-role="user">Existing request\nRequest ID: restored</div><article><div data-message-author-role="assistant">{"answers":[{"questionKey":"Q1","answers":[{"answerText":"result"}]}]}</div><button data-testid="copy-turn-action-button"></button></article>');
+        c.deliver('restored', 'Existing request', undefined, { resume: true, mayHaveSent: true });
+        await c.advance(6000);
+        assert.equal(c.sends, 0);
+        assert.equal(c.inserted.length, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, /result/);
+    } finally { c.dom.window.close(); }
+});
+
+test('uncertain requests missing after reload stop explicitly instead of stalling or resending', async () => {
+    const c = chat();
+    try {
+        c.deliver('not-visible', 'Original prompt', undefined, { resume: true, mayHaveSent: true });
+        await c.advance(31000);
+        assert.equal(c.sends, 0);
+        assert.equal(c.inserted.length, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /previously sent request is not visible/);
+    } finally { c.dom.window.close(); }
+});
+
+test('an unsent request can resume normally after the adapter reloads', async () => {
+    const c = chat();
+    try {
+        c.deliver('unsent', 'Original prompt', undefined, { resume: true, mayHaveSent: false });
+        await c.advance(6000);
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+        const phases = c.messages.filter(m => m.type === 'PARAMEXT_CHATGPT_PHASE').map(m => m.phase);
+        assert.deepEqual(phases, ['sending', 'submitted']);
+    } finally { c.dom.window.close(); }
+});
+
+test('streaming assistant trees are not cloned while waiting for the final response', async () => {
+    const c = chat();
+    try {
+        c.deliver(); await c.advance(300);
+        const reply = c.w.document.querySelector('[data-message-author-role="assistant"]').closest('article');
+        assert.ok(reply);
+        let clones = 0;
+        const original = reply.cloneNode.bind(reply);
+        reply.cloneNode = (...args) => { clones++; return original(...args); };
+        const stop = c.w.document.createElement('button'); stop.dataset.testid = 'stop-button'; c.w.document.body.appendChild(stop);
+        await c.advance(3000);
+        assert.equal(clones, 0);
+        stop.remove(); await c.advance(5000);
+        assert.equal(clones, 1, 'completed response parsing is cached while waiting for stability');
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('text-file chips outside the form send despite unrelated composer aria-busy state', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        mockImageUpload(c, true, '.txt');
+        c.w.document.querySelector('form').setAttribute('aria-busy', 'true');
+        c.deliver('plain-chip', 'questions '.repeat(2000)); await c.advance(9000);
+        assert.equal(c.sends, 1);
+        assert.equal(c.w.document.querySelector('form [data-testid="attachment"]'), null);
+        assert.equal(c.w.document.querySelector('form img'), null);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('a document filename split across nested spans still confirms the attachment', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        const input = mockImageUpload(c, false, '.txt');
+        input.addEventListener('change', () => {
+            const card = c.w.document.createElement('div');
+            const name = c.w.document.createElement('div');
+            for (const part of ['moodush-questions-', 'split-name', '.txt']) {
+                const span = c.w.document.createElement('span'); span.textContent = part; name.appendChild(span);
+            }
+            card.appendChild(name); c.w.document.body.appendChild(card);
+        });
+        c.deliver('split-name', 'questions '.repeat(2000)); await c.advance(9000);
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('upload progress next to the form delays sending until the file finishes', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        mockImageUpload(c, true, '.txt');
+        const progress = c.w.document.createElement('div'); progress.setAttribute('role', 'progressbar');
+        c.w.document.body.appendChild(progress);
+        c.deliver('upload-progress', 'questions '.repeat(2000)); await c.advance(3000);
+        assert.equal(c.sends, 0);
+        progress.remove(); await c.advance(9000);
+        assert.equal(c.sends, 1);
+    } finally { c.dom.window.close(); }
+});
+
+test('a filename mentioned only in conversation history cannot confirm an absent upload', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        mockImageUpload(c, false, '.txt');
+        const previous = c.w.document.createElement('article'); previous.setAttribute('data-message-author-role', 'assistant');
+        previous.textContent = 'moodush-questions-history-only.txt'; c.w.document.body.appendChild(previous);
+        c.deliver('history-only', 'questions '.repeat(2000)); await c.advance(62000);
+        assert.equal(c.sends, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /filenames: 0\/1/);
+    } finally { c.dom.window.close(); }
+});
+
+test('upload can replace the composer and sending uses the replacement editor', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        const input = mockImageUpload(c, true, '.txt');
+        input.addEventListener('change', () => {
+            const old = c.w.document.querySelector('#prompt-textarea');
+            const text = old.textContent; old.closest('form').remove();
+            const editor = c.mount(); editor.textContent = text;
+            editor.dispatchEvent(new c.w.InputEvent('input', { bubbles: true }));
+        });
+        c.deliver('remounted', 'questions '.repeat(2000)); await c.advance(9000);
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('an explicit upload failure stops sending even when the filename and send button exist', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        const input = mockImageUpload(c, true, '.txt');
+        input.addEventListener('change', () => {
+            const card = [...c.w.document.body.children].find(node => node.id !== 'moodush-chatgpt-status' && node.textContent.includes('moodush-questions-upload-error') && node.tagName === 'DIV');
+            card.appendChild(c.w.document.createTextNode(' Upload failed'));
+        });
+        c.deliver('upload-error', 'questions '.repeat(2000)); await c.advance(5000);
+        assert.equal(c.sends, 0);
+        assert.match(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.error, /could not upload the attachment/);
+    } finally { c.dom.window.close(); }
+});
+
+test('file chips remain visible to confirmation when the active composer is inside a Work turn', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        const input = mockImageUpload(c, true, '.txt');
+        const turn = c.w.document.createElement('section'); turn.setAttribute('data-turn-key', 'active-work-turn');
+        c.w.document.body.appendChild(turn); turn.appendChild(c.w.document.querySelector('form'));
+        input.addEventListener('change', () => {
+            const chip = [...c.w.document.body.children].find(node => node.tagName === 'DIV' && node.textContent.includes('moodush-questions-work-chip'));
+            turn.appendChild(chip);
+        });
+        c.deliver('work-chip', 'questions '.repeat(2000)); await c.advance(9000);
+        assert.equal(c.sends, 1);
+        assert.equal(c.messages.find(m => m.type === 'PARAMEXT_CHATGPT_RESULT')?.text, '{"answers":[]}');
+    } finally { c.dom.window.close(); }
+});
+
+test('retry replaces its own failed file-upload draft when the new request gets a new filename', async () => {
+    const c = chat({ contenteditable: true });
+    try {
+        const failedInput = mockImageUpload(c, false, '.txt');
+        const prompt = 'questions '.repeat(2000);
+        c.deliver('failed-old', prompt); await c.advance(62000);
+        assert.equal(c.sends, 0);
+        assert.ok(c.w.document.querySelector('#prompt-textarea').textContent.includes('moodush-questions-failed-old.txt'));
+        failedInput.remove(); mockImageUpload(c, true, '.txt');
+        c.deliver('retry-new', prompt); await c.advance(9000);
+        assert.equal(c.sends, 1);
+        assert.ok(c.inserted.at(-1).includes('moodush-questions-retry-new.txt'));
+        assert.equal(c.messages.filter(m => m.type === 'PARAMEXT_CHATGPT_RESULT').at(-1)?.text, '{"answers":[]}');
     } finally { c.dom.window.close(); }
 });

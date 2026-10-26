@@ -8,14 +8,15 @@ function page(problems) {
     return pageHtml(body);
 }
 
-function pageHtml(body) {
+function pageHtml(body, asFrame = false) {
     const dom = new JSDOM('<!doctype html><body>' + body, { url: 'https://courses.openedu.ru/xblock/test', runScripts: 'outside-only' });
     const w = dom.window;
     w.chrome = { runtime: { onMessage: { addListener() {} } } };
     w.HTMLElement.prototype.getBoundingClientRect = () => ({ width: 800, height: 30, top: 0, left: 0 });
     for (const file of ['platform_settings', 'openedu_shared', 'openedu_course_api', 'openedu_parser', 'openedu_ai', 'openedu_capture_frames', 'openedu_content']) {
         let code = fs.readFileSync(require.resolve('../js/' + file + '.js'), 'utf8');
-        if (file === 'openedu_content') code = code.replace('    boot();', 'window.__test = { parseQuestions, buildQuestionAiExport, buildAiPromptText, captureAiQuestions, requestApplyAnswers };');
+        if (file === 'openedu_content' && asFrame) code = code.replace('const isTopFrame = window === window.top;', 'const isTopFrame = false;');
+        if (file === 'openedu_content') code = code.replace('    boot();', 'window.__test = { parseQuestions, buildQuestionAiExport, buildAiPromptText, captureAiQuestions, requestApplyAnswers, syncIframeStateToTop };');
         w.eval(code);
     }
     const questions = w.__test.parseQuestions();
@@ -292,4 +293,45 @@ test('inline dropdown sentences also parse from data-content before the live DOM
         assert.match(p.questions[0].prompt, /\[ANSWER 1\] их случайным образом/);
         assert.match(p.questions[1].prompt, /\[ANSWER 1\] вокруг пользователя/);
     } finally { p.dom.window.close(); fixture.window.close(); }
+});
+
+const mixedUnsupportedFixture = fs.readFileSync(require.resolve('./fixtures/openedu-mixed-unsupported.html'), 'utf8');
+
+test('mixed-page export keeps matching/radio tasks and omits the unsupported simulator', () => {
+    const p = pageHtml(mixedUnsupportedFixture);
+    try {
+        assert.equal(p.w.ParamExtOpeneduShared.findUnsupportedTasks(p.w.document).length, 1);
+        assert.equal(p.questions.length, 2);
+        assert.deepEqual(Array.from(p.questions, q => q.questionType), ['drag_table', 'single_choice']);
+        assert.match(p.questions[1].prompt, /Ваша рабочая группа вынесла на итоговое обсуждение/);
+        assert.ok(p.export().every(q => q.type !== 'unknown'));
+        // Even if the simulator later mounts native choices, it must stay out
+        // of the parser, prompt, and answer application workflow.
+        p.w.document.querySelector('.jsinput').insertAdjacentHTML('beforeend', '<fieldset><legend>UNSUPPORTED SIMULATOR</legend><input type="radio" id="sim_choice" name="sim_choice"><label for="sim_choice">SIMULATOR ONLY ANSWER</label></fieldset>');
+        const parsed = p.w.__test.parseQuestions();
+        assert.equal(parsed.length, 2);
+        const prompt = p.w.__test.buildAiPromptText(parsed.map((question, index) => ({ question, index })));
+        assert.ok(!prompt.includes('UNSUPPORTED SIMULATOR'));
+        assert.ok(!prompt.includes('SIMULATOR ONLY ANSWER'));
+    } finally { p.dom.window.close(); }
+});
+
+test('iframe synchronization preserves supported question types and omits unsupported tasks', () => {
+    const p = pageHtml(mixedUnsupportedFixture, true);
+    const messages = [];
+    p.w.top.postMessage = message => messages.push(message);
+    try {
+        p.w.__test.syncIframeStateToTop({}, p.questions, { online: true });
+        const sync = messages.find(message => message.type === 'PARAMEXT_OPENEDU_QUESTIONS_SYNC');
+        assert.ok(sync);
+        assert.equal(sync.questions.length, 2);
+        assert.deepEqual(Array.from(sync.questions, q => q.questionType), ['drag_table', 'single_choice']);
+        assert.ok(sync.questions.every(q => q.questionFingerprint && q.parserSource && q.parseConfidence > 0));
+        // A structured clone at the top page has no DOM references.
+        const remote = JSON.parse(JSON.stringify(sync.questions));
+        const exported = p.w.__test.buildQuestionAiExport(remote.map((question, index) => ({ question, index })));
+        assert.deepEqual(Array.from(exported, q => q.type), ['drag_table', 'single_choice']);
+        delete remote[0].questionType;
+        assert.equal(p.w.__test.buildQuestionAiExport([{ question: remote[0], index: 0 }])[0].type, 'drag_table');
+    } finally { p.dom.window.close(); }
 });
